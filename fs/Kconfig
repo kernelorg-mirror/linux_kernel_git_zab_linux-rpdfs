@@ -416,6 +416,7 @@ config NFS_V4_2_SSC_HELPER
 
 source "net/sunrpc/Kconfig"
 source "fs/ceph/Kconfig"
+source "fs/rpdfs/Kconfig"
 
 source "fs/smb/Kconfig"
 source "fs/coda/Kconfig"

@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0
+
+config RPDFS_FS
+	tristate "RPDFS filesystem support"
+
+	help
+	  RPDFS is a filesystem.
+
+	  To compile this file system support as a module, choose M here. The
+	  module will be called rpdfs.
+
+	  If unsure, say N.

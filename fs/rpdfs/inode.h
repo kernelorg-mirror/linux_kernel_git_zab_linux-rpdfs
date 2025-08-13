@@ -1,0 +1,65 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+#ifndef RPDFS_INODE_H
+#define RPDFS_INODE_H
+
+#include <linux/fs.h>
+
+#include "format-block.h"
+#include "block.h"
+#include "txn.h"
+
+struct rpdfs_inode_info {
+	u64 ino;
+
+	/* updating vfs inode while preparing read references to blocks */
+	seqlock_t refresh_seqlock;
+	u64 refresh_wcount;
+
+	struct rpdfs_ino_gen ig;
+	struct rpdfs_btree_root dirents;
+
+	struct inode vfs_inode;
+};
+
+static inline struct rpdfs_inode_info *RPDFS_I(struct inode *inode)
+{
+	return container_of(inode, struct rpdfs_inode_info, vfs_inode);
+}
+
+static inline struct rpdfs_ino_gen *rpdfs_inode_ig(struct inode *inode)
+{
+	return &RPDFS_I(inode)->ig;
+}
+
+static inline u64 rpdfs_ino_bnr(u64 bnr)
+{
+	return bnr;
+}
+
+static inline u64 rpdfs_inode_ino(struct inode *inode)
+{
+	return le64_to_cpu(RPDFS_I(inode)->ig.ino);
+}
+
+static inline u64 rpdfs_inode_bnr(struct inode *inode)
+{
+	return rpdfs_ino_bnr(rpdfs_inode_ino(inode));
+}
+
+struct inode *rpdfs_alloc_inode(struct super_block *sb);
+void rpdfs_free_inode(struct inode *inode);
+int rpdfs_write_inode(struct inode *inode, struct writeback_control *wbc);
+
+void rpdfs_inode_init_ops(struct inode *inode);
+
+struct inode *rpdfs_iget(struct super_block *sb, struct rpdfs_ino_gen *ig);
+struct inode *rpdfs_new_inode(struct super_block *sb, struct rpdfs_ino_gen *ig);
+int rpdfs_inode_txn_prepare(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
+			    struct inode *inode, rbaf_t rbaf);
+void rpdfs_inode_txn_update(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
+			    struct inode *inode);
+
+int rpdfs_inode_init(void);
+void rpdfs_inode_exit(void);
+
+#endif
