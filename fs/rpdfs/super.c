@@ -230,18 +230,6 @@ static void rpdfs_kill_sb(struct super_block *sb)
 	if (!rfi)
 		return;
 
-	{
-		struct inode *inode;
-		spin_lock(&sb->s_inode_list_lock);
-		list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
-			rpdfs_prd("inode %p ri %p ino %llu i_count %d dent empt %u",
-				  inode, RPDFS_I(inode), rpdfs_inode_ino(inode),
-				  atomic_read(&inode->i_count), hlist_empty(&inode->i_dentry));
-
-		}
-		spin_unlock(&sb->s_inode_list_lock);
-	}
-
 	kill_anon_super(sb);
 	rpdfs_destroy(rfi);
 }
