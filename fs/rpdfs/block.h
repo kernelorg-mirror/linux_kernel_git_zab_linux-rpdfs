@@ -71,6 +71,7 @@ typedef struct rpdfs_block_handle *(*rpdfs_block_entry_handle_fn_t)(struct list_
 void rpdfs_block_make_dirty(struct rpdfs_fs_info *rfi, struct list_head *list,
 			    rpdfs_block_entry_handle_fn_t entry_handle_fn);
 int rpdfs_block_flush(struct rpdfs_fs_info *rfi, u64 bnr, bool wait);
+int rpdfs_block_sync(struct rpdfs_fs_info *rfi, bool wait);
 
 int rpdfs_block_setup(struct rpdfs_fs_info *rfi);
 void rpdfs_block_destroy(struct rpdfs_fs_info *rfi);

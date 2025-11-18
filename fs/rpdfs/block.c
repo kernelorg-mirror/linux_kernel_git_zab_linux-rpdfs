@@ -622,6 +622,24 @@ static bool extend_boundary(struct rpdfs_dirty_boundary *dst, struct rpdfs_dirty
 }
 
 /*
+ * Set the caller's boundary to cover the latest blocks dirtied in each
+ * dlist at the time of the call.  This can miss later dirtying that
+ * happens while this call is iterating over the lists.
+ */
+static void set_boundary_last_dirty(struct rpdfs_block_info *binf,
+				    struct rpdfs_dirty_boundary *bnd)
+{
+	struct rpdfs_dirty_list *dlist;
+	int i;
+
+	for (i = 0; i < NR_DIRTY_LISTS; i++) {
+		dlist = &binf->dirty_lists[i];
+		while_read_seqretry(&dlist->seqlock)
+			bnd->seq[i] = dlist->dirty_seq;
+	}
+}
+
+/*
  * The caller is an exclusive writer of the block so only we can dirty
  * it, but we use the bk seqlock to consistently serialize with retrying
  * readers.
@@ -1159,20 +1177,36 @@ static bool flushed_within(struct rpdfs_block_info *binf, struct rpdfs_dirty_bou
 }
 
 /*
- * If the caller's block is dirty then we start flushing it, possibly
- * waiting to return an error if the flush attempt failed.  The block
- * may not be currently dirty or even cached.
- *
  * XXX Errors aren't plumbed through write results and distributed write
  * completion to here.  I think we could have a simple list of pending
  * flush waiters.  If we see an io error for a write within their
  * boundary we can set it in their waiting entry on a list and wake
  * them.  Both waiters and errors are both rare slow paths.
  */
+static int flush_and_wait(struct rpdfs_block_info *binf, struct rpdfs_dirty_boundary *bnd,
+			  bool wait)
+{
+	struct rpdfs_flusher *flshr = binf->flshr;
+	int ret;
+
+	queue_boundary_flush(binf, bnd);
+
+	if (wait)
+		ret = wait_event_interruptible(flshr->waitq, flushed_within(binf, bnd));
+	else
+		ret = 0;
+
+	return ret;
+}
+
+/*
+ * If the caller's block is dirty then we start flushing it, possibly
+ * waiting to return an error if the flush attempt failed.  The block
+ * may not be currently dirty or even cached.
+ */
 int rpdfs_block_flush(struct rpdfs_fs_info *rfi, u64 bnr, bool wait)
 {
 	struct rpdfs_block_info *binf = RPDFS_BINF(rfi);
-	struct rpdfs_flusher *flshr = binf->flshr;
 	struct rpdfs_dirty_boundary bnd;
 	struct rpdfs_block *bk;
 	bool dirty;
@@ -1192,14 +1226,27 @@ int rpdfs_block_flush(struct rpdfs_fs_info *rfi, u64 bnr, bool wait)
 	put_block(bk);
 
 	if (dirty)
-		queue_boundary_flush(binf, &bnd);
-
-	if (dirty && wait)
-		ret = wait_event_interruptible(flshr->waitq, flushed_within(binf, &bnd));
+		ret = flush_and_wait(binf, &bnd, wait);
 	else
 		ret = 0;
 out:
 	return ret;
+}
+
+/*
+ * Queue flushing of any dirty blocks that were dirtied at the time of
+ * the call, possibly waiting for all the blocks to be flushed before
+ * returning.  This will not flush or wait for blocks that are dirtied
+ * after it samples the initial boundary of blocks on the dirty lists.
+ */
+int rpdfs_block_sync(struct rpdfs_fs_info *rfi, bool wait)
+{
+	struct rpdfs_block_info *binf = RPDFS_BINF(rfi);
+	struct rpdfs_dirty_boundary bnd;
+
+	set_boundary_last_dirty(binf, &bnd);
+
+	return flush_and_wait(binf, &bnd, wait);
 }
 
 /*
