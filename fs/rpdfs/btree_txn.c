@@ -460,7 +460,7 @@ int rpdfs_btree_txn_prepare_lookup(struct rpdfs_fs_info *rfi, struct rpdfs_trans
  * transaction.
  *
  * The caller's key can land after the last item in a leaf block so we
- * won't copy any items even though there are more item in the tree.  If
+ * won't copy any items even though there are more items in the tree.  If
  * this happens we'll advance the search key past the end of the first
  * leaf and try again, but only once.
  */

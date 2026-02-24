@@ -694,7 +694,7 @@ int rpdfs_btree_lookup_cb(struct rpdfs_fs_info *rfi, struct rpdfs_btree_block *b
 	ind = find_key_ind(bt, key);
 	init_bti(&a, bt, ind);
 	init_bti(&b, bt, ind + 1);
-	init_bti(&b, bt, ind + 2);
+	init_bti(&c, bt, ind + 2);
 
 	return item_cb(rfi, &a, &b, &c, cb_arg);
 }
