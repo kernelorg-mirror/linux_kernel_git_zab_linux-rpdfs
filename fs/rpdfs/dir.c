@@ -677,9 +677,11 @@ out:
 
 const struct inode_operations rpdfs_dir_iops = {
 	.create		= rpdfs_create,
+	.getattr	= rpdfs_getattr,
 	.lookup		= rpdfs_lookup,
 	.mkdir		= rpdfs_mkdir,
 	.rename		= rpdfs_rename,
+	.setattr	= rpdfs_setattr,
 };
 
 const struct file_operations rpdfs_dir_fops = {

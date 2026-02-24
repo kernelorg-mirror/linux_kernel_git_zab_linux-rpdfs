@@ -52,6 +52,13 @@ int rpdfs_write_inode(struct inode *inode, struct writeback_control *wbc);
 
 void rpdfs_inode_init_ops(struct inode *inode);
 
+int rpdfs_getattr(struct mnt_idmap *idmap, const struct path *path,
+		  struct kstat *stat, u32 request_mask,
+		  unsigned int query_flags);
+
+int rpdfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+		  struct iattr *attr);
+
 struct inode *rpdfs_iget(struct super_block *sb, struct rpdfs_ino_gen *ig);
 struct inode *rpdfs_new_inode(struct super_block *sb, struct rpdfs_ino_gen *ig);
 int rpdfs_inode_txn_prepare(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,

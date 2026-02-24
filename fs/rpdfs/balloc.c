@@ -96,7 +96,7 @@ void rpdfs_balloc_start_apply(struct rpdfs_fs_info *rfi, struct rpdfs_transactio
 
 /*
  * Apply and return the result of an allocation that was prepared by
- * _prepare_alloc.  The caller can use _txn_use_prepare() to get the
+ * _prepare_alloc.  The caller can use _txn_use_prepared() to get the
  * allocated block.
  */
 int rpdfs_balloc_apply_alloc(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,

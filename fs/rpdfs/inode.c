@@ -4,6 +4,7 @@
 #include <linux/slab.h>
 #include <linux/rcupdate.h>
 #include <linux/writeback.h>
+#include <linux/iversion.h>
 
 #include "dir.h"
 #include "file.h"
@@ -116,6 +117,7 @@ void rpdfs_inode_init_ops(struct inode *inode)
 		break;
 	default:
 		init_special_inode(inode, inode->i_mode, inode->i_rdev);
+		break;
 	}
 }
 
@@ -361,6 +363,75 @@ int rpdfs_write_inode(struct inode *inode, struct writeback_control *wbc)
 	ret = rpdfs_block_flush(rfi, bnr, wbc->sync_mode == WB_SYNC_ALL);
 	if (ret < 0)
 		mark_inode_dirty_sync(inode);
+	return ret;
+}
+
+int rpdfs_getattr(struct mnt_idmap *idmap, const struct path *path,
+		  struct kstat *stat, u32 request_mask,
+		  unsigned int query_flags)
+{
+	struct inode *inode = d_inode(path->dentry);
+	struct rpdfs_fs_info *rfi = RPDFS_INODE_FS(inode);
+	struct rpdfs_block_handle *hnd = NULL;
+	DECLARE_RPDFS_TXN(txn);
+	int ret;
+
+	do {
+		ret = rpdfs_inode_txn_prepare(rfi, &txn, inode, 0);
+	} while (rpdfs_txn_retry(rfi, &txn, &ret));
+
+	if (ret < 0)
+		goto out;
+
+	if (request_mask & STATX_BTIME) {
+		struct rpdfs_inode *rinode;
+
+		ret = rpdfs_txn_use_prepared(rfi, &txn, rpdfs_inode_bnr(inode),
+					     &hnd, 0);
+		if (ret < 0)
+			goto out;
+
+		rinode = hnd->data;
+
+		stat->result_mask |= STATX_BTIME;
+		stat->btime = ns_to_timespec64(le64_to_cpu(rinode->crtime_nsec));
+	}
+
+	generic_fillattr(idmap, request_mask, inode, stat);
+
+out:
+	rpdfs_txn_reset(rfi, &txn);
+
+	return ret;
+}
+
+int rpdfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+		  struct iattr *attr)
+{
+	struct inode *inode = d_inode(dentry);
+	struct rpdfs_fs_info *rfi = RPDFS_INODE_FS(inode);
+	DECLARE_RPDFS_TXN(txn);
+	int ret;
+
+	do {
+		ret = rpdfs_inode_txn_prepare(rfi, &txn, inode, RBAF_WRITE);
+	} while (rpdfs_txn_retry(rfi, &txn, &ret));
+
+	if (ret < 0)
+		goto out;
+
+	ret = setattr_prepare(idmap, dentry, attr);
+	if (ret)
+		goto out;
+
+	setattr_copy(idmap, inode, attr);
+	inode_inc_iversion(inode);
+
+	rpdfs_inode_txn_update(rfi, &txn, inode);
+
+out:
+	rpdfs_txn_reset(rfi, &txn);
+
 	return ret;
 }
 
