@@ -3,6 +3,7 @@
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/rbtree.h>
+#include <linux/percpu.h>
 
 #include "balloc.h"
 #include "block.h"
@@ -12,39 +13,56 @@
 
 struct rpdfs_txn_block {
 	struct rb_node node;
-	struct list_head head;
+	struct list_head write_head;
+	struct list_head alloc_head;
 	struct rpdfs_block_handle *hnd;
+	struct rpdfs_balloc_region *reg;
 	u64 wcount;
 	u64 bnr;
 	rbaf_t rbaf;
 	bool prepared;
 };
 
-struct rb_parent_link {
-	struct rb_node *parent;
-	struct rb_node **link;
-};
-
-static struct rpdfs_txn_block *find_tblk(struct rb_root *root, u64 bnr, struct rb_parent_link *pl)
+/*
+ * Return a tblk at the given bnr, allocating a new tblk if one wasn't
+ * already present.  The wcount is only used to initialize an allocated
+ * tblk so that callers can always test it.
+ */
+static struct rpdfs_txn_block *get_tblk(struct rb_root *root, u64 bnr, u64 wcount, bool alloc)
 {
-	struct rpdfs_txn_block *tblk;
+	struct rb_node *parent = NULL;
+	struct rb_node **link = &root->rb_node;
+	struct rpdfs_txn_block *tblk = NULL;
 
-	pl->parent = NULL;
-	pl->link = &root->rb_node;
-
-	while (*pl->link) {
-		pl->parent = *pl->link;
-		tblk = container_of(*pl->link, struct rpdfs_txn_block, node);
+	while (*link) {
+		parent = *link;
+		tblk = container_of(*link, struct rpdfs_txn_block, node);
 
 		if (bnr < tblk->bnr)
-			pl->link = &(*pl->link)->rb_left;
+			link = &(*link)->rb_left;
 		else if (bnr > tblk->bnr)
-			pl->link = &(*pl->link)->rb_right;
+			link = &(*link)->rb_right;
 		else
-			return tblk;
+			break;
+		tblk = NULL;
 	}
 
-	return NULL;
+	if (!tblk && alloc) {
+		tblk = kzalloc(sizeof(struct rpdfs_txn_block), GFP_NOFS);
+		if (!tblk) {
+			tblk = ERR_PTR(-ENOMEM);
+		} else  {
+			INIT_LIST_HEAD(&tblk->write_head);
+			INIT_LIST_HEAD(&tblk->alloc_head);
+			tblk->bnr = bnr;
+			tblk->wcount = wcount;
+
+			rb_link_node(&tblk->node, parent, link);
+			rb_insert_color(&tblk->node, root);
+		}
+	}
+
+	return tblk;
 }
 
 /*
@@ -64,8 +82,6 @@ int rpdfs_txn_prepare_acquire(struct rpdfs_fs_info *rfi, struct rpdfs_transactio
 {
 	struct rpdfs_block_handle *hnd = NULL;
 	struct rpdfs_txn_block *tblk;
-	struct rb_parent_link pl;
-	bool found;
 	int ret;
 
 	if (WARN_ON_ONCE(txn->prep_tblk) ||
@@ -74,29 +90,17 @@ int rpdfs_txn_prepare_acquire(struct rpdfs_fs_info *rfi, struct rpdfs_transactio
 		goto out;
 	}
 
-	tblk = find_tblk(&txn->blocks, bnr, &pl);
-	found = tblk != NULL;
-	if (!found) {
-		tblk = kzalloc(sizeof(struct rpdfs_txn_block), GFP_NOFS);
-		if (!tblk) {
-			ret = -ENOMEM;
-			goto out;
-		}
-
-		INIT_LIST_HEAD(&tblk->head);
-		tblk->bnr = bnr;
-
-		rb_link_node(&tblk->node, pl.parent, pl.link);
-		rb_insert_color(&tblk->node, &txn->blocks);
-	}
-
 	ret = rpdfs_block_acquire(rfi, bnr, &hnd, 0);
 	if (ret < 0)
 		goto out;
 
-	if (!found) {
-		tblk->wcount = hnd->wcount;
-	} else if (hnd->wcount != tblk->wcount) {
+	tblk = get_tblk(&txn->blocks, bnr, hnd->wcount, true);
+	if (IS_ERR(tblk)) {
+		ret = PTR_ERR(tblk);
+		goto out;
+	}
+
+	if (hnd->wcount != tblk->wcount) {
 		ret = -EAGAIN;
 		goto out;
 	}
@@ -144,6 +148,112 @@ void rpdfs_txn_prepare_release(struct rpdfs_fs_info *rfi, struct rpdfs_transacti
 	rpdfs_block_release(rfi, hnd);
 }
 
+/*
+ * Prepare a block allocation.  On success, a writable block will be
+ * available during apply.
+ *
+ * If bnr_ret is provided then the caller is given the bnr and they will
+ * call _txn_use_prepared to get the returned block during apply.  This
+ * is rarely used when the caller must prepare resources before apply
+ * that depend on the bnr that will be allocated (allocating vfs inode
+ * resources f.e.).  Block numbers returned in this way are considered
+ * allocated during applied and so must be used or they will be lost.
+ *
+ * If bnr_ret is NULL then the block is stored in the txn and the caller
+ * will use _txn_apply_alloc which returns the next prepared block
+ * during apply.  This is typically used when the allocated bnr is only
+ * used during apply itself.  It is safe to prepare more of these blocks
+ * than are applied.
+ */
+int rpdfs_txn_prepare_alloc(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn, u64 *bnr_ret)
+{
+	struct rpdfs_block_handle *hnd = NULL;
+	struct rpdfs_txn_block *tblk;
+	u64 bnr;
+	int ret;
+
+	for (;;) {
+		if (txn->reg == NULL) {
+			/* get region from balloc via block cache messaging */
+			txn->reg = rpdfs_balloc_take_region(rfi);
+			if (IS_ERR(txn->reg)) {
+				ret = PTR_ERR(txn->reg);
+				txn->reg = NULL;
+				goto out;
+			}
+			txn->reg_pos = 0;
+			list_add_tail(&txn->reg->head, &txn->reg_list);
+		}
+
+		ret = rpdfs_balloc_find_next(txn->reg, &txn->reg_pos, &bnr);
+		if (ret < 0) {
+			txn->reg = NULL;
+			/* retry after consuming regions, hard enospc comes from block/balloc */
+			if (ret == -ENOSPC)
+				continue;
+			goto out;
+		}
+
+		ret = rpdfs_block_acquire(rfi, bnr, &hnd, RBAF_ALLOC | RBAF_WRITE | RBAF_OVERWRITE);
+		if (ret < 0) {
+			/* bnr might not still be free, clear and try again with next */
+			if (ret == -ENODATA) {
+				rpdfs_balloc_clear(txn->reg, bnr);
+				continue;
+			}
+			goto out;
+		}
+		break;
+	}
+
+	tblk = get_tblk(&txn->blocks, bnr, hnd->wcount, true);
+	if (IS_ERR(tblk)) {
+		ret = PTR_ERR(tblk);
+		goto out;
+	}
+
+	if (hnd->wcount != tblk->wcount) {
+		ret = -EAGAIN;
+		goto out;
+	}
+
+	/* only initial has _ALLOC restrictions, retry can block, wcount protects reuse */
+	tblk->prepared = true;
+	tblk->rbaf = RBAF_WRITE | RBAF_OVERWRITE;
+	tblk->reg = txn->reg;
+
+	if (bnr_ret) {
+		*bnr_ret = hnd->bnr;
+		list_add_tail(&tblk->alloc_head, &txn->applied_allocs);
+	} else {
+		list_add_tail(&tblk->alloc_head, &txn->prepared_allocs);
+	}
+	ret = 0;
+out:
+	rpdfs_block_release(rfi, &hnd);
+	return ret;
+}
+
+int rpdfs_txn_apply_alloc(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn, u64 *bnr_ret)
+{
+	struct rpdfs_txn_block *tblk;
+	int ret;
+
+	if (WARN_ON_ONCE(!txn->applying))
+		return -EINVAL;
+
+	tblk = list_first_entry_or_null(&txn->prepared_allocs, struct rpdfs_txn_block, alloc_head);
+	if (tblk) {
+		*bnr_ret = tblk->bnr;
+		list_move_tail(&tblk->alloc_head, &txn->applied_allocs);
+		ret = 0;
+	} else {
+		ret = -ENOSPC;
+	}
+
+	return ret;
+}
+
 /* XXX might be nice to get this upstream? */
 #define rbtree_for_each_entry_safe(pos, n, root, field)						\
 	for (pos = rb_entry_safe(rb_first(root), typeof(*pos), field);				\
@@ -155,15 +265,17 @@ static void free_tblk(struct rb_root *root, struct rpdfs_txn_block *tblk)
 	if (!IS_ERR_OR_NULL(tblk)) {
 		if (!RB_EMPTY_NODE(&tblk->node))
 			rb_erase(&tblk->node, root);
-		if (!list_empty(&tblk->head))
-			list_del_init(&tblk->head);
+		if (!list_empty(&tblk->write_head))
+			list_del_init(&tblk->write_head);
+		if (!list_empty(&tblk->alloc_head))
+			list_del_init(&tblk->alloc_head);
 		kfree(tblk);
 	}
 }
 
 static struct rpdfs_block_handle *tblk_block_entry_handle_fn(struct list_head *pos)
 {
-	struct rpdfs_txn_block *tblk = list_entry(pos, struct rpdfs_txn_block, head);
+	struct rpdfs_txn_block *tblk = list_entry(pos, struct rpdfs_txn_block, write_head);
 
 	return tblk->hnd;
 }
@@ -178,12 +290,18 @@ typedef enum {
 static void reset_txn(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
 		      rtf_t rtf, struct rpdfs_txn_block *stop)
 {
+	struct rpdfs_balloc_region *reg;
+	struct rpdfs_balloc_region *_reg_;
 	struct rpdfs_txn_block *tblk;
 	struct rpdfs_txn_block *_tblk_;
 
 	rbtree_for_each_entry_safe(tblk, _tblk_, &txn->blocks, node) {
-		if (!list_empty(&tblk->head))
-			list_del_init(&tblk->head);
+		if (!list_empty(&tblk->write_head))
+			list_del_init(&tblk->write_head);
+		if (!list_empty(&tblk->alloc_head))
+			list_del_init(&tblk->alloc_head);
+
+		tblk->reg = NULL;
 
 		if (rtf & RTF_RELEASE)
 			rpdfs_block_release(rfi, &tblk->hnd);
@@ -194,6 +312,14 @@ static void reset_txn(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
 		if ((rtf & RTF_STOP_AT) && tblk == stop)
 			break;
 	}
+
+	txn->reg = NULL;
+	list_for_each_entry_safe_reverse(reg, _reg_, &txn->reg_list, head) {
+		list_del_init(&reg->head);
+		rpdfs_balloc_return_region(rfi, reg);
+	}
+
+	txn->applying = 0;
 }
 
 /*
@@ -277,22 +403,22 @@ restart:
 
 		/* gather all write refs for dirtying */
 		if (tblk->rbaf & RBAF_WRITE)
-			list_add_tail(&tblk->head, &txn->writes);
+			list_add_tail(&tblk->write_head, &txn->writes);
 	}
 
-	if (err == 0 && !list_empty(&txn->writes))
-		rpdfs_block_make_dirty(rfi, &txn->writes, tblk_block_entry_handle_fn);
+	if (err == 0) {
+		txn->applying = 1;
+		if (!list_empty(&txn->writes))
+			rpdfs_block_make_dirty(rfi, &txn->writes, tblk_block_entry_handle_fn);
+	}
 out:
 	txn->force_retry = 0;
 
 	if (retry) {
 		reset_txn(rfi, txn, RTF_RELEASE | RTF_CLEAR_PREP, NULL);
-		rpdfs_balloc_reset_prepare(rfi, txn);
 	} else {
 		if (err < 0 && *caller_err == 0)
 			*caller_err = err;
-		if (*caller_err == 0)
-			rpdfs_balloc_start_apply(rfi, txn);
 	}
 
 	return retry;
@@ -314,11 +440,10 @@ int rpdfs_txn_use_prepared(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *
 			   struct rpdfs_block_handle **hnd_ret, rbaf_t rbaf)
 {
 	struct rpdfs_txn_block *tblk;
-	struct rb_parent_link pl;
 	int ret;
 
-	tblk = find_tblk(&txn->blocks, bnr, &pl);
-	if (WARN_ON_ONCE(!tblk)) {
+	tblk = get_tblk(&txn->blocks, bnr, 0, false);
+	if (WARN_ON_ONCE(IS_ERR_OR_NULL(tblk))) {
 		ret = -EINVAL;
 		goto out;
 	}
@@ -349,5 +474,13 @@ out:
  */
 void rpdfs_txn_reset(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn)
 {
+	struct rpdfs_txn_block *tblk;
+	struct rpdfs_txn_block *_tblk_;
+
+	if (txn->applying) {
+		list_for_each_entry_safe(tblk, _tblk_, &txn->applied_allocs, alloc_head)
+			rpdfs_balloc_clear(tblk->reg, tblk->bnr);
+	}
+
 	reset_txn(rfi, txn, RTF_RELEASE | RTF_FREE, NULL);
 }
