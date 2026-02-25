@@ -420,7 +420,7 @@ static struct inode *create_new_inode(struct mnt_idmap *idmap, struct inode *dir
 	}
 
 	do {
-		ret = rpdfs_balloc_prepare_alloc_peek(rfi, &txn, &bnr);
+		ret = rpdfs_txn_prepare_alloc(rfi, &txn, &bnr);
 		if (ret == 0) {
 			if (le64_to_cpu(ig.ino) != bnr) {
 				ig.ino = cpu_to_le64(bnr);
@@ -442,10 +442,6 @@ static struct inode *create_new_inode(struct mnt_idmap *idmap, struct inode *dir
 	} while (rpdfs_txn_retry(rfi, &txn, &ret));
 	if (ret < 0)
 		goto out;
-
-	/* allocation must have matched preparation */
-	rpdfs_balloc_apply_alloc(rfi, &txn, &bnr);
-	BUG_ON(le64_to_cpu(ig.ino) != bnr);
 
 	/* update vfs inodes */
 	inode_init_owner(idmap, inode, dir, mode);

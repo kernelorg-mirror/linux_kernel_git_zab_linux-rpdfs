@@ -104,7 +104,7 @@ static int btree_txn_prepare_write(struct rpdfs_fs_info *rfi, struct rpdfs_trans
 			goto out;
 		}
 
-		ret = rpdfs_balloc_prepare_alloc(rfi, txn);
+		ret = rpdfs_txn_prepare_alloc(rfi, txn, NULL);
 		if (ret < 0)
 			goto out;
 	}
@@ -165,7 +165,7 @@ static int btree_txn_prepare_write(struct rpdfs_fs_info *rfi, struct rpdfs_trans
 			goto out;
 
 		while (nr_allocs-- > 0) {
-			ret = rpdfs_balloc_prepare_alloc(rfi, txn);
+			ret = rpdfs_txn_prepare_alloc(rfi, txn, NULL);
 			if (ret < 0)
 				goto out;
 		}
@@ -203,7 +203,7 @@ static int apply_alloc_ref(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *
 	u64 bnr;
 	int ret;
 
-	ret = rpdfs_balloc_apply_alloc(rfi, txn, &bnr);
+	ret = rpdfs_txn_apply_alloc(rfi, txn, &bnr);
 	if (ret == 0) {
 		/* XXX will have more metadata, probably? */
 		*ref = (struct rpdfs_block_ref) {
