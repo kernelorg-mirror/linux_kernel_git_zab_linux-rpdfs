@@ -6,10 +6,12 @@
 #include <linux/wait.h>
 #include <linux/rhashtable.h>
 
+#include "balloc.h"
 #include "block.h"
 #include "compare.h"
 #include "format-block.h"
 #include "format-msg.h"
+#include "ht.h"
 #include "lists.h"
 #include "map.h"
 #include "net.h"
@@ -64,6 +66,10 @@ struct rpdfs_block_info {
 	struct workqueue_struct *workq;
 	struct rpdfs_flusher *flshr;
 	struct rpdfs_dirty_list *dirty_lists;
+
+	atomic64_t regions_started;
+	atomic64_t regions_done;
+	struct rhashtable rbld_ht;
 };
 
 static struct rpdfs_block_info *RPDFS_BINF(struct rpdfs_fs_info *rfi)
@@ -129,9 +135,9 @@ struct rpdfs_dist_write {
  * a read or request_mode message.
  *
  * @grant_mode is the mode that new references must be compatible with.
- * It's only set by the server as we receive either read_result or
- * grant_mode messages.  It's decreased after receiving a revocation,
- * users drain, and we send a confirmation.
+ * It's set by the server as we receive read_result, grant_mode, or
+ * free_stripe_grant messages.  It's decreased after receiving a
+ * revocation, users drain, and we send a confirmation.
  *
  * @confirm_mode is the record of a confirm that we must send once
  * current users are compatible with the confirm mode.  It is set as we
@@ -176,12 +182,39 @@ enum {
 
 #define bitfield_char(f, c) ((f) ? c : '-')
 #define RBF \
-	"bnr %llu wc %llu refc %llx rd %lu %c%c%c%c rm %u gm %u cm %u wcm %u"
+	"bnr %llu ac %llu wc %llu refc %llx rd %lu %c%c%c%c rm %u gm %u cm %u wcm %u"
 #define RBA(bk) \
-	(bk)->hnd.bnr, (bk)->hnd.wcount, atomic64_read(&(bk)->refcount), (bk)->readers, \
-	bitfield_char(bk->dirty, 'd'), bitfield_char(bk->upd_meta,  'M'), \
+	(bk)->hnd.bnr, (bk)->hnd.alloc_ctr, (bk)->hnd.wcount, atomic64_read(&(bk)->refcount), \
+	(bk)->readers, bitfield_char(bk->dirty, 'd'), bitfield_char(bk->upd_meta,  'M'), \
 	bitfield_char(bk->upd_data, 'D'), bitfield_char(bk->writer,  'w'), \
 	(bk)->request_mode, (bk)->grant_mode, (bk)->confirm_mode, (bk)->write_confirm_mode
+
+static const struct rhashtable_params block_ht_params = {
+	.key_len	= sizeof_field(struct rpdfs_block, hnd.bnr),
+	.key_offset	= offsetof(struct rpdfs_block, hnd.bnr),
+	.head_offset	= offsetof(struct rpdfs_block, rhead),
+};
+
+/*
+ * These record the write grants that we've received for free stripes
+ * that only contain block details, not contents.  We translate these
+ * bits and details into full cached blocks as individual blocks are
+ * used locally.
+ */
+struct rpdfs_block_region_builder {
+	struct rpdfs_ht_entry hte;
+	struct rpdfs_fs_info *rfi;
+	u64 base_bnr;
+	atomic_t in_flight;
+	spinlock_t lock;
+	struct rpdfs_balloc_region *reg;
+};
+
+static const struct rhashtable_params rbld_ht_params = {
+	.key_len	= sizeof_field(struct rpdfs_block_region_builder, base_bnr),
+	.key_offset	= offsetof(struct rpdfs_block_region_builder, base_bnr),
+	.head_offset	= offsetof(struct rpdfs_block_region_builder, hte.rhead),
+};
 
 /*
  * We trigger a flush once a dirty list exceeds this block limit.  The
@@ -190,12 +223,6 @@ enum {
  * count over the limit.
  */
 #define DIRTY_BLOCK_LIMIT	128
-
-static const struct rhashtable_params block_ht_params = {
-	.key_len	= sizeof_field(struct rpdfs_block, hnd.bnr),
-	.key_offset	= offsetof(struct rpdfs_block, hnd.bnr),
-	.head_offset	= offsetof(struct rpdfs_block, rhead),
-};
 
 static u8 mode_from_rbaf(rbaf_t rbaf)
 {
@@ -235,6 +262,11 @@ static bool block_is_none(struct rpdfs_block *bk)
 	       bk->confirm_mode <= RPDFS_CACHE_MODE_NONE;
 }
 
+static bool alloc_ctr_is_free(u64 alloc_ctr)
+{
+	return (alloc_ctr & 1) == 0;
+}
+
 /*
  * Returns true if references of the two modes are compatible.  NULL and
  * NONE are compatible with everything.  The only incompatible
@@ -248,25 +280,62 @@ static bool modes_compatible(u8 low, u8 high)
 	return high < RPDFS_CACHE_MODE_WRITE || low < RPDFS_CACHE_MODE_READ;
 }
 
-static struct rpdfs_block *alloc_block(gfp_t gfp)
+/*
+ * Make sure that the block has a data page assigned.  If it doesn't,
+ * allocate one.
+ */
+static int alloc_data_page(struct rpdfs_block *bk, gfp_t gfp)
+{
+	struct page *page;
+
+	while_read_seqretry(&bk->seqlock)
+		page = bk->data_page;
+	if (page)
+		return 0;
+
+	page = alloc_page(gfp);
+	if (!page)
+		return -ENOMEM;
+
+	write_seqlock(&bk->seqlock);
+	if (!bk->data_page) {
+		bk->data_page = page;
+		bk->hnd.data = page_address(bk->data_page);
+		page = NULL;
+	}
+	write_sequnlock(&bk->seqlock);
+
+	if (page)
+		put_page(page);
+
+	return 0;
+}
+
+static struct rpdfs_block *alloc_block(bool with_page, gfp_t gfp)
 {
 	struct rpdfs_block *bk;
+	int ret;
 
 	bk = kzalloc(sizeof(struct rpdfs_block), gfp);
-	if (bk)
-		bk->data_page = alloc_page(gfp);
-	if (!bk || !bk->data_page) {
-		kfree(bk);
-		bk = NULL;
-	} else {
-		INIT_LIST_HEAD(&bk->lru_head);
-		bk->hnd.data = page_address(bk->data_page);
-		atomic64_set(&bk->refcount, 0);
-		seqlock_init(&bk->seqlock);
-		init_waitqueue_head(&bk->waitq);
-		INIT_LIST_HEAD(&bk->dirty_head);
+	if (!bk) {
+		bk = ERR_PTR(-ENOMEM);
+		goto out;
 	}
 
+	if (with_page) {
+		ret = alloc_data_page(bk, gfp);
+		if (ret < 0) {
+			bk = ERR_PTR(ret);
+			goto out;
+		}
+	}
+
+	INIT_LIST_HEAD(&bk->lru_head);
+	atomic64_set(&bk->refcount, 0);
+	seqlock_init(&bk->seqlock);
+	init_waitqueue_head(&bk->waitq);
+	INIT_LIST_HEAD(&bk->dirty_head);
+out:
 	return bk;
 }
 
@@ -279,7 +348,8 @@ static void free_block(struct rpdfs_block *bk)
 	BUG_ON(bk->readers || bk->writer);
 
 	/* rcu protects bk, not page.. that's only referenced with refcount */
-	put_page(bk->data_page);
+	if (bk->data_page)
+		put_page(bk->data_page);
 	kfree_rcu(bk, rcu);
 }
 
@@ -399,11 +469,79 @@ static struct rpdfs_block *lookup_block(struct rpdfs_block_info *binf, u64 bnr)
 	return bk;
 }
 
+static void publish_region_rcu(struct rcu_head *head)
+{
+	struct rpdfs_block_region_builder *rbld;
+
+	rbld = container_of(head, struct rpdfs_block_region_builder, hte.rcu);
+	rpdfs_balloc_publish_region(rbld->rfi, rbld->reg);
+	kfree(rbld);
+}
+
+/*
+ * We need to wait for a grace period before rcu readers are done with
+ * the region and we can hand it off to balloc.  So we model it like
+ * kfree_rcu.  Once no requests are in flight and the refcounts drop we
+ * hand off to an rcu callback which publishes it with balloc once the
+ * grace period ends.
+ */
+static void put_rbld(struct rpdfs_block_info *binf, struct rpdfs_block_region_builder *rbld)
+{
+	if (IS_ERR_OR_NULL(rbld))
+		return;
+
+	rcu_read_lock();
+	if (rpdfs_ht_put(&binf->rbld_ht, &rbld->hte, rbld_ht_params,
+			 atomic_read(&rbld->in_flight) == 0)) {
+		atomic64_inc(&binf->regions_done);
+		call_rcu(&rbld->hte.rcu, publish_region_rcu);
+	}
+	rcu_read_unlock();
+}
+
+static struct rpdfs_block_region_builder *get_rbld(struct rpdfs_fs_info *rfi,
+						   struct rpdfs_block_info *binf,
+						   u64 base_bnr, unsigned long stripes)
+{
+	struct rpdfs_block_region_builder *ins;
+	struct rpdfs_ht_entry *hte;
+
+	hte = rpdfs_ht_get(&binf->rbld_ht, &base_bnr, rbld_ht_params);
+	if (hte)
+		goto out;
+
+	ins = kzalloc(sizeof(struct rpdfs_block_region_builder), GFP_NOFS);
+	if (ins)
+		ins->reg = rpdfs_balloc_alloc_region(base_bnr,
+						     RPDFS_MSG_BLOCKS_PER_FREE_STRIPE * stripes);
+	if (!ins || !ins->reg) {
+		kfree(ins);
+		hte = ERR_PTR(-ENOMEM);
+		goto out;
+	}
+
+	ins->rfi = rfi;
+	ins->base_bnr = base_bnr;
+	atomic_set(&ins->in_flight, stripes);
+	spin_lock_init(&ins->lock);
+
+	hte = rpdfs_ht_insert(&binf->rbld_ht, &ins->hte, rbld_ht_params);
+	if (hte != &ins->hte)
+		put_rbld(binf, ins);
+
+out:
+	if (IS_ERR_OR_NULL(hte))
+		return ERR_CAST(hte);
+	else
+		return container_of(hte, struct rpdfs_block_region_builder, hte);
+}
+
 /*
  * Returns the block with a refcount if found or allocated, or
  * ERR_PTR(-errno) on error.
  */
-static struct rpdfs_block *lookup_or_alloc_block(struct rpdfs_block_info *binf, u64 bnr, gfp_t gfp)
+static struct rpdfs_block *lookup_or_alloc_block(struct rpdfs_block_info *binf, u64 bnr,
+						 bool with_page, gfp_t gfp)
 {
 	struct rpdfs_block *found;
 	struct rpdfs_block *bk;
@@ -411,11 +549,9 @@ static struct rpdfs_block *lookup_or_alloc_block(struct rpdfs_block_info *binf, 
 
 	bk = lookup_block(binf, bnr);
 	if (!bk) {
-		bk = alloc_block(gfp);
-		if (!bk) {
-			bk = ERR_PTR(-ENOMEM);
+		bk = alloc_block(with_page, gfp);
+		if (IS_ERR(bk))
 			goto out;
-		}
 
 		bk->hnd.bnr = bnr;
 		/* our refcount stops shrinker->scan->walk->isolate from removing */
@@ -470,8 +606,8 @@ static int send_block_read(struct rpdfs_fs_info *rfi, u64 bnr, u8 mode, bool wit
 	return ret;
 }
 
-static int send_block_write(struct rpdfs_fs_info *rfi, u64 bnr, u64 wcount, u8 mode,
-			    struct page *data_page, gfp_t gfp)
+static int send_block_write(struct rpdfs_fs_info *rfi, u64 bnr, u64 alloc_ctr, u64 wcount,
+			    u8 mode, struct page *data_page, gfp_t gfp)
 {
 	struct rpdfs_net_transport_addr addr;
 	struct rpdfs_msg_block_write wr;
@@ -486,6 +622,7 @@ static int send_block_write(struct rpdfs_fs_info *rfi, u64 bnr, u64 wcount, u8 m
 	int ret;
 
 	wr.bnr = cpu_to_le64(bnr);
+	wr.alloc_ctr = cpu_to_le64(alloc_ctr);
 	wr.wcount = cpu_to_le64(wcount);
 	wr.confirm_mode = mode;
 	memzero_explicit(&wr._pad, sizeof(wr._pad));
@@ -523,6 +660,36 @@ static int send_block_cache_mode(struct rpdfs_fs_info *rfi, u64 bnr, u8 type, u8
 }
 
 /*
+ * For _SEARCH requests the bnr is only used locally to map to a devd.
+ */
+static int send_free_stripe_request(struct rpdfs_fs_info *rfi, u64 bnr, u64 flags, gfp_t gfp)
+{
+	struct rpdfs_net_transport_addr addr;
+	struct rpdfs_msg_free_stripe_request fsr;
+	struct rpdfs_net_message_desc md = {
+		.type = RPDFS_MSG_FREE_STRIPE_REQUEST,
+		.ctl_buf = &fsr,
+		.ctl_size = sizeof(fsr),
+	};
+	u64 mver;
+	int ret;
+
+	if (flags & RPDFS_MSG_FREE_STRIPE_REQUEST_FLAG_SEARCH)
+		fsr.bnr = 0;
+	else
+		fsr.bnr = cpu_to_le64(bnr);
+	fsr.flags = flags;
+	memzero_explicit(&fsr._pad, sizeof(fsr._pad));
+
+	ret = rpdfs_map_bnr_to_addr(rfi, bnr, &addr, &mver);
+	if (ret == 0)
+		ret = rpdfs_net_send(rfi, &addr, &md, gfp);
+	BUG_ON(ret < 0);
+
+	return ret;
+}
+
+/*
  * See if we can send an explicit confirmation of a previously received
  * revocation.  We can't have active users that conflict with the mode.
  * If we sent a confirm mode with a flushing write then we have to wait
@@ -542,6 +709,7 @@ static int try_send_confirm(struct rpdfs_fs_info *rfi, struct rpdfs_block *bk)
 		if (ret == 0) {
 			bk->grant_mode = bk->confirm_mode;
 			if (bk->grant_mode == RPDFS_CACHE_MODE_NONE) {
+				bk->hnd.alloc_ctr = 0;
 				bk->hnd.wcount = 0;
 				bk->upd_meta = 0;
 				bk->upd_data = 0;
@@ -654,6 +822,8 @@ static unsigned long make_dirty(struct rpdfs_block_info *binf, struct rpdfs_bloc
 		write_seqcount_begin_nested(&dlist->seqlock.seqcount, SINGLE_DEPTH_NESTING);
 
 		bk->dirty = 1;
+		if (alloc_ctr_is_free(bk->hnd.alloc_ctr))
+			bk->hnd.alloc_ctr++;
 		bk->hnd.wcount++;
 		bk->dirty_seq = ++dlist->dirty_seq;
 		bk->dirty_list_nr = nr;
@@ -778,8 +948,8 @@ static void rpdfs_block_write_work_fn(struct work_struct *work)
 		}
 		write_sequnlock(&bk->seqlock);
 
-		ret = send_block_write(rfi, bk->hnd.bnr, bk->hnd.wcount, mode,
-				       bk->data_page, GFP_NOFS);
+		ret = send_block_write(rfi, bk->hnd.bnr, bk->hnd.alloc_ctr, bk->hnd.wcount,
+				       mode, bk->data_page, GFP_NOFS);
 		BUG_ON(ret < 0);
 	}
 
@@ -985,11 +1155,21 @@ int rpdfs_block_acquire(struct rpdfs_fs_info *rfi, u64 bnr, struct rpdfs_block_h
 		goto out;
 	}
 
-	bk = lookup_or_alloc_block(binf, bnr, GFP_NOFS);
+	if ((rbaf & RBAF_ALLOC)) {
+		bk = lookup_block(binf, bnr);
+		if (!bk)
+			bk = ERR_PTR(-ENODATA);
+	} else {
+		bk = lookup_or_alloc_block(binf, bnr, true, GFP_NOFS);
+	}
 	if (IS_ERR(bk)) {
 		ret = PTR_ERR(bk);
 		goto out;
 	}
+
+	ret = alloc_data_page(bk, GFP_NOFS);
+	if (ret < 0)
+		goto out;
 
 	mode = mode_from_rbaf(rbaf);
 	need_data = !(rbaf & RBAF_OVERWRITE);
@@ -1004,6 +1184,15 @@ int rpdfs_block_acquire(struct rpdfs_fs_info *rfi, u64 bnr, struct rpdfs_block_h
 		if (bk->error && !(rbaf & RBAF_OVERWRITE)) {
 			/* return a read error */
 			ret = bk->error;
+
+		} else if ((rbaf & RBAF_ALLOC) &&
+			   !(bk->grant_mode == RPDFS_CACHE_MODE_WRITE &&
+			     bk->confirm_mode == RPDFS_CACHE_MODE_NULL &&
+			     readers_writer_mode(bk) == RPDFS_CACHE_MODE_NONE &&
+			     !dirty_within_flush(binf, bk) &&
+			     alloc_ctr_is_free(bk->hnd.alloc_ctr))) {
+			/* only satisfy allocs from idle write mode free blocks */
+			ret = -ENODATA;
 
 		} else if ((mode > bk->grant_mode) || (
 			    bk->confirm_mode && mode > bk->confirm_mode)) {
@@ -1240,6 +1429,43 @@ int rpdfs_block_sync(struct rpdfs_fs_info *rfi, bool wait)
 }
 
 /*
+ * Returns true when the caller could send a free stripe request to keep
+ * one in flight.  &until is initialized to 0 and then set by each send.
+ */
+bool rpdfs_block_should_request_free(struct rpdfs_fs_info *rfi, u64 until)
+{
+	struct rpdfs_block_info *binf = RPDFS_BINF(rfi);
+
+	return atomic64_read(&binf->regions_done) >= until;
+}
+
+/*
+ * Send a request, and update the caller's until so that
+ * _should_request_free will return .. roughly once our request has been
+ * processed.
+ *
+ * We round-robin requests amongst the devds by having an increasing
+ * _started counter that acts as a fake block number that is mapped to
+ * the devds.
+ */
+int rpdfs_block_request_free(struct rpdfs_fs_info *rfi, u64 *until)
+{
+	struct rpdfs_block_info *binf = RPDFS_BINF(rfi);
+	u64 bnr;
+	int ret;
+
+	bnr = atomic64_inc_return(&binf->regions_started);
+	ret = send_free_stripe_request(rfi, bnr, RPDFS_MSG_FREE_STRIPE_REQUEST_FLAG_SEARCH,
+				       GFP_NOFS);
+	if (ret < 0)
+		atomic64_inc(&binf->regions_done);
+	else
+		*until = bnr;
+
+	return ret;
+}
+
+/*
  * Receive a read result for our previously sent read.  We must have
  * pinned the block while the request was in flight.  If we send a mode
  * request while the read is in flight then the read response might
@@ -1260,11 +1486,11 @@ static int recv_block_read_result(struct rpdfs_fs_info *rfi, struct rpdfs_net_me
 		goto out;
 	}
 
-	/* XXX not sure how to test that server didn't mess up req->set->active */
 	write_seqlock(&bk->seqlock);
-	if (rr->grant_mode && rr->grant_mode > bk->request_mode) {
+	if (rr->grant_mode && rr->grant_mode < bk->grant_mode) {
 		ret = -EPROTO;
 	} else {
+		bk->hnd.alloc_ctr = le64_to_cpu(rr->alloc_ctr);
 		bk->hnd.wcount = le64_to_cpu(rr->wcount);
 		bk->upd_meta = 1;
 
@@ -1281,7 +1507,7 @@ static int recv_block_read_result(struct rpdfs_fs_info *rfi, struct rpdfs_net_me
 		/* can immediately elevate mode, server serializes with revoke */
 		if (rr->grant_mode) {
 			bk->grant_mode = rr->grant_mode;
-			if (bk->request_mode == rr->grant_mode) {
+			if (bk->request_mode <= rr->grant_mode) {
 				bk->request_mode = RPDFS_CACHE_MODE_NULL;
 				put_block(bk);
 			}
@@ -1320,6 +1546,7 @@ static int recv_block_write_result(struct rpdfs_fs_info *rfi, struct rpdfs_net_m
 	if (bk->write_confirm_mode) {
 		bk->grant_mode = bk->write_confirm_mode;
 		if (bk->grant_mode == RPDFS_CACHE_MODE_NONE) {
+			bk->hnd.alloc_ctr = 0;
 			bk->hnd.wcount = 0;
 			bk->upd_meta = 0;
 			bk->upd_data = 0;
@@ -1351,6 +1578,10 @@ out:
  * grant response.  We can send back to back requests for increasing
  * modes.  We may get back to back grants, or we may get a grant for the
  * highest mode by the time the server processes the request.
+ *
+ * Our request can cross with a free_stripe_grant that gives us a higher
+ * mode than we requested.  Then the server will grant us the current mode, which
+ * can be higher than the requested mode.
  */
 static int recv_block_grant_mode(struct rpdfs_fs_info *rfi, struct rpdfs_net_message_desc *md)
 {
@@ -1369,13 +1600,13 @@ static int recv_block_grant_mode(struct rpdfs_fs_info *rfi, struct rpdfs_net_mes
 
 	rpdfs_prd("mode %u "RBF, cm->mode, RBA(bk));
 
-	/* can't get grant we haven't requested, and grants should only elevate */
+	/* grants should only elevate */
 	write_seqlock(&bk->seqlock);
-	if (cm->mode > bk->request_mode || cm->mode < bk->grant_mode) {
+	if (cm->mode < bk->grant_mode) {
 		ret = -EPROTO;
 	} else {
 		bk->grant_mode = cm->mode;
-		if (bk->request_mode == cm->mode) {
+		if (bk->request_mode <= cm->mode) {
 			bk->request_mode = RPDFS_CACHE_MODE_NULL;
 			put_block(bk);
 		}
@@ -1442,6 +1673,118 @@ static int recv_block_revoke_mode(struct rpdfs_fs_info *rfi, struct rpdfs_net_me
 		wake_up_all(&bk->waitq);
 put:
 	put_block(bk);
+out:
+	return ret;
+}
+
+/*
+ * Receive a free stripe grant from the server.  The message contains
+ * details for any blocks in the devd's stripe that were free and that
+ * we now have been granted write mode.
+ *
+ * This incoming stripe could be the first from a region that was the
+ * result of a search.  In this case we send requests to the rest of the
+ * devds that own the rest of the stripes.
+ *
+ * For each block, the server granted write mode when no one had the
+ * block cached.  The only way we could have a local cached block
+ * allocated for these free blocks is if we sent a request while the
+ * incoming free stripe grant was in flight.  Because the search returns
+ * an unknown block, we don't have blocks that recorded that we had a
+ * free stripe request in flight.  In effect, this can be an unsolicited
+ * write grant that crosses the wire with other requests.  We must
+ * update the mode to match the server, but we don't have block data so
+ * the request will still see a read result.
+ */
+static int recv_free_stripe_grant(struct rpdfs_fs_info *rfi, struct rpdfs_net_message_desc *md)
+{
+	struct rpdfs_block_info *binf = RPDFS_BINF(rfi);
+	struct rpdfs_msg_free_stripe_grant *fsg = md->ctl_buf;
+	struct rpdfs_msg_free_stripe_detail *fsd = NULL;
+	const u64 grant_bnr = le64_to_cpu(fsg->bnr);
+	struct rpdfs_block_region_builder *rbld;
+	unsigned long this_stripe;
+	unsigned long stripes;
+	struct rpdfs_block *bk;
+	int nr_blocks;
+	u64 mver;
+	u64 bnr;
+	int b;
+	int i;
+	int ret;
+
+	/* we're handing a le bitmap to bitmap_weight, can't deal with partial words */
+	BUILD_BUG_ON((sizeof(fsg->bmap) % sizeof(long)) != 0);
+
+	nr_blocks = bitmap_weight((unsigned long *)fsg->bmap, RPDFS_MSG_BLOCKS_PER_FREE_STRIPE);
+	if (md->data_size != nr_blocks * sizeof(fsd[0])) {
+		ret = -EPROTO;
+		goto out;
+	}
+
+	if (nr_blocks)
+		fsd = page_address(md->data_page);
+
+	/* XXX we're ignoring the mver output here */
+	ret = rpdfs_map_alloc_stripe_geom(rfi, grant_bnr, &this_stripe, &stripes, &mver);
+	if (ret < 0)
+		goto out;
+
+	for (b = 0, i = 0;
+	     (b = find_next_bit_le(&fsg->bmap, RPDFS_MSG_BLOCKS_PER_FREE_STRIPE, b))
+			< RPDFS_MSG_BLOCKS_PER_FREE_STRIPE;
+	     b++, i++) {
+		bnr = grant_bnr + (b * stripes);
+
+		bk = lookup_or_alloc_block(binf, bnr, false, GFP_NOFS);
+		if (IS_ERR(bk)) {
+			ret = PTR_ERR(bk);
+			goto out;
+		}
+
+		write_seqlock(&bk->seqlock);
+		bk->hnd.alloc_ctr = le64_to_cpu(fsd[i].alloc_ctr);
+		bk->hnd.wcount = le64_to_cpu(fsd[i].wcount);
+		bk->upd_meta = 1;
+		bk->grant_mode = RPDFS_CACHE_MODE_WRITE;
+		write_sequnlock(&bk->seqlock);
+
+		/* most will be newly allocated and idle, but might have request waiters */
+		wake_up_all(&bk->waitq);
+		put_block(bk);
+	}
+
+	bnr = grant_bnr - this_stripe;
+	rbld = get_rbld(rfi, binf, bnr, stripes);
+	if (IS_ERR(rbld)) {
+		ret = PTR_ERR(rbld);
+		goto out;
+	}
+
+	/* only the first search result for a given rbld will send requests to others */
+	if (fsg->flags & RPDFS_MSG_FREE_STRIPE_GRANT_FLAG_SEARCH) {
+		if (atomic_cmpxchg(&rbld->in_flight, stripes, stripes - 1) == stripes) {
+			for (i = 0; i < stripes; i++) {
+				if (i == this_stripe)
+					continue;
+				ret = send_free_stripe_request(rfi, bnr + i, 0, GFP_NOFS);
+				if (ret < 0)
+					atomic_dec(&rbld->in_flight);
+			}
+		}
+	} else {
+		atomic_dec(&rbld->in_flight);
+	}
+
+	spin_lock(&rbld->lock);
+	rpdfs_balloc_set_stripe_bits(rbld->reg, this_stripe, stripes, fsg->bmap,
+				     RPDFS_MSG_BLOCKS_PER_FREE_STRIPE);
+	spin_unlock(&rbld->lock);
+
+	/* reg is published to balloc in rcu calback once in_flight == 0 */
+	put_rbld(binf, rbld);
+
+	ret = 0;
 out:
 	return ret;
 }
@@ -1565,6 +1908,8 @@ int rpdfs_block_setup(struct rpdfs_fs_info *rfi)
 
 	binf->rfi = rfi;
 	init_flusher(binf, binf->flshr);
+	atomic64_set(&binf->regions_started, 0);
+	atomic64_set(&binf->regions_done, 0);
 
 	binf->shrinker->scan_objects = rpdfs_block_scan_objects;
 	binf->shrinker->count_objects = rpdfs_block_count_objects;
@@ -1591,11 +1936,16 @@ int rpdfs_block_setup(struct rpdfs_fs_info *rfi)
 	ret = rpdfs_net_register_recv(rfi, RPDFS_MSG_BLOCK_READ_RESULT, recv_block_read_result) ?:
 	      rpdfs_net_register_recv(rfi, RPDFS_MSG_BLOCK_WRITE_RESULT, recv_block_write_result) ?:
 	      rpdfs_net_register_recv(rfi, RPDFS_MSG_BLOCK_GRANT_MODE, recv_block_grant_mode) ?:
-	      rpdfs_net_register_recv(rfi, RPDFS_MSG_BLOCK_REVOKE_MODE, recv_block_revoke_mode);
+	      rpdfs_net_register_recv(rfi, RPDFS_MSG_BLOCK_REVOKE_MODE, recv_block_revoke_mode) ?:
+	      rpdfs_net_register_recv(rfi, RPDFS_MSG_FREE_STRIPE_GRANT, recv_free_stripe_grant);
 	if (ret < 0)
 		goto out;
 
 	ret = rhashtable_init(&binf->block_ht, &block_ht_params);
+	if (ret < 0)
+		goto out;
+
+	ret = rhashtable_init(&binf->rbld_ht, &rbld_ht_params);
 	if (ret < 0)
 		goto out;
 
@@ -1616,6 +1966,8 @@ out:
 					  recv_block_grant_mode);
 		rpdfs_net_unregister_recv(rfi, RPDFS_MSG_BLOCK_REVOKE_MODE,
 					  recv_block_revoke_mode);
+		rpdfs_net_unregister_recv(rfi, RPDFS_MSG_FREE_STRIPE_GRANT,
+					  recv_free_stripe_grant);
 		if (binf->flshr) {
 			free_dist_writes(&binf->flshr->idle_writes, &binf->flshr->busy_writes);
 			kfree(binf->flshr);
@@ -1657,6 +2009,19 @@ static void free_and_destroy_block(void *ptr, void *arg)
 	}
 }
 
+/*
+ * There should be no more users of the builders as we're destroying.
+ * The caller has removed from the hash table and we just need to free.
+ */
+static void free_and_destroy_rbld(void *ptr, void *arg)
+{
+	struct rpdfs_block_region_builder *rbld = ptr;
+
+	if (rbld->reg)
+		rpdfs_balloc_free_region(rbld->reg);
+	kfree(rbld);
+}
+
 void rpdfs_block_destroy(struct rpdfs_fs_info *rfi)
 {
 	struct rpdfs_block_info *binf = RPDFS_BINF(rfi);
@@ -1671,6 +2036,8 @@ void rpdfs_block_destroy(struct rpdfs_fs_info *rfi)
 					  recv_block_grant_mode);
 		rpdfs_net_unregister_recv(rfi, RPDFS_MSG_BLOCK_REVOKE_MODE,
 					  recv_block_revoke_mode);
+		rpdfs_net_unregister_recv(rfi, RPDFS_MSG_FREE_STRIPE_GRANT,
+					  recv_free_stripe_grant);
 		shrinker_free(binf->shrinker);
 
 		cancel_work_sync(&binf->flshr->work);
@@ -1684,6 +2051,7 @@ void rpdfs_block_destroy(struct rpdfs_fs_info *rfi)
 		rhashtable_free_and_destroy(&binf->block_ht, free_and_destroy_block, binf);
 		list_lru_destroy(&binf->lru);
 		free_dist_writes(&binf->flshr->idle_writes, &binf->flshr->busy_writes);
+		rhashtable_free_and_destroy(&binf->rbld_ht, free_and_destroy_rbld, NULL);
 		kfree(binf->flshr);
 		kfree(binf);
 

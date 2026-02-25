@@ -45,12 +45,22 @@ enum {
 	 * -EAGAIN.
 	 */
 	_RBAF_NONBLOCK_FLUSH,
+
+	/*
+	 * An acquisition for an allocation.  Only satisfy with blocks
+	 * that are already granted a write mode and whose alloc_ctr
+	 * indicates that they're free.  This won't send requests for
+	 * blocks or wait.  Returns -ENODATA if the block wasn't already
+	 * cached, writable, and free.
+	 */
+	_RBAF_ALLOC,
 };
 
 #define RBAF_WRITE		((__force rbaf_t)BIT(_RBAF_WRITE))
 #define RBAF_OVERWRITE		((__force rbaf_t)BIT(_RBAF_OVERWRITE))
 #define RBAF_NONBLOCK_MODE	((__force rbaf_t)BIT(_RBAF_NONBLOCK_MODE))
 #define RBAF_NONBLOCK_FLUSH	((__force rbaf_t)BIT(_RBAF_NONBLOCK_FLUSH))
+#define RBAF_ALLOC		((__force rbaf_t)BIT(_RBAF_ALLOC))
 
 /*
  * Shared read or exclusive write handles are acquired in the form of
@@ -58,6 +68,7 @@ enum {
  */
 struct rpdfs_block_handle {
 	u64 bnr;
+	u64 alloc_ctr;
 	u64 wcount;
 	void *data;
 };
@@ -72,6 +83,9 @@ void rpdfs_block_make_dirty(struct rpdfs_fs_info *rfi, struct list_head *list,
 			    rpdfs_block_entry_handle_fn_t entry_handle_fn);
 int rpdfs_block_flush(struct rpdfs_fs_info *rfi, u64 bnr, bool wait);
 int rpdfs_block_sync(struct rpdfs_fs_info *rfi, bool wait);
+
+bool rpdfs_block_should_request_free(struct rpdfs_fs_info *rfi, u64 until);
+int rpdfs_block_request_free(struct rpdfs_fs_info *rfi, u64 *until);
 
 int rpdfs_block_setup(struct rpdfs_fs_info *rfi);
 void rpdfs_block_destroy(struct rpdfs_fs_info *rfi);
