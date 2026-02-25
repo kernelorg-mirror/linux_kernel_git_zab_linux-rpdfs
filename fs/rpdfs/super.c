@@ -6,6 +6,7 @@
 #include <linux/fs.h>
 #include <linux/fs_context.h>
 #include <linux/fs_parser.h>
+#include <linux/statfs.h>
 
 #include "balloc.h"
 #include "block.h"
@@ -22,9 +23,19 @@ struct rpdfs_fs_context {
 	bool mkfs;
 };
 
+static int rpdfs_statfs(struct dentry *dentry, struct kstatfs *buf)
+{
+	buf->f_type = RPDFS_SUPER_MAGIC;
+	buf->f_bsize = RPDFS_BLOCK_SIZE;
+	buf->f_namelen = RPDFS_NAME_MAX;
+
+	return 0;
+}
+
 static const struct super_operations rpdfs_sop = {
 	.alloc_inode	= rpdfs_alloc_inode,
 	.free_inode	= rpdfs_free_inode,
+	.statfs		= rpdfs_statfs,
 	.write_inode	= rpdfs_write_inode,
 };
 
