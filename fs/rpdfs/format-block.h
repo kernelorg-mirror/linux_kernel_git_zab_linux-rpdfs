@@ -177,7 +177,10 @@ struct rpdfs_dirent {
 	struct rpdfs_ino_gen ig; /* inode number and generation */
 	__u8 pers_dtype; /* rpdfs persistent directory entry type */
 	__u8 name_len; /* no null termination */
-	__u8 name[6]; /* definition pads to alignment, stored can be smaller */
+	union {
+		__u8 pad[6]; /* pad to alignment, stored can be smaller */
+		DECLARE_FLEX_ARRAY(__u8, name);
+	};
 };
 
 /* max dirent name length, without null term */
@@ -210,13 +213,15 @@ struct rpdfs_dirent {
 /*
  * xattrs are currently implemented as btree items, whose keys are the
  * hash of the name combined with the xattr_create_counter value in the
- * inode, which makes the keys unique - no collisions. name is padded to
- * alignment but will be bigger.
+ * inode, which makes the keys unique - no collisions.
  */
 struct rpdfs_xattr {
 	__le16 val_len;
 	__u8 name_len;
-	__u8 name[1];
+	union {
+		__u8 pad[1]; /* pad to alignment, stored will be bigger */
+		DECLARE_FLEX_ARRAY(__u8, name);
+	};
 };
 
 /*
