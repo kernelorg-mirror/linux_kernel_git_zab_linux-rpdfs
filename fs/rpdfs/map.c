@@ -5,6 +5,7 @@
 
 #include "map.h"
 #include "net.h"
+#include "seqlock.h"
 
 struct addr_map {
 	struct rcu_head rcu;
@@ -103,6 +104,36 @@ int rpdfs_map_bnr_to_addr(struct rpdfs_fs_info *rfi, u64 bnr,
 			ret = -ENOENT;
 		}
 	} while (read_seqretry(&minf->seqlock, seq));
+	rcu_read_unlock();
+
+	return ret;
+}
+
+/*
+ * bnr is the first block in the stripe.  Give the caller the stripe
+ * number and the number of stripes.
+ */
+int rpdfs_map_alloc_stripe_geom(struct rpdfs_fs_info *rfi, u64 bnr, unsigned long *this_stripe,
+				unsigned long *stripes, u64 *mver)
+{
+	struct rpdfs_map_info *minf = RPDFS_MINF(rfi);
+	struct addr_map *amap;
+	u32 rem;
+	int ret;
+
+	rcu_read_lock();
+	while_read_seqretry(&minf->seqlock) {
+		amap = rcu_dereference(minf->amap);
+		*mver = minf->mver;
+		if (amap && amap->count > 0) {
+			div_u64_rem(bnr, amap->count, &rem);
+			*this_stripe = rem;
+			*stripes = amap->count;
+			ret = 0;
+		} else {
+			ret = -ENOENT;
+		}
+	}
 	rcu_read_unlock();
 
 	return ret;
