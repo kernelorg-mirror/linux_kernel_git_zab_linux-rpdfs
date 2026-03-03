@@ -15,6 +15,7 @@
 #include "net.h"
 #include "pr.h"
 #include "rht.h"
+#include "seqlock.h"
 
 /*
  * This block cache sits between callers who use cached block contents
@@ -246,17 +247,6 @@ static bool modes_compatible(u8 low, u8 high)
 
 	return high < RPDFS_CACHE_MODE_WRITE || low < RPDFS_CACHE_MODE_READ;
 }
-
-/*
- * Execute the for() loop statement at least once, and continue
- * executing it as long as read_seqretry() says we have to.  The caller
- * can safely break out of the statement but they can't trust any output
- * of the statement if they do so.
- */
-#define while_read_seqretry(seql) \
-	for (unsigned seq__, retry__ = 1; \
-	     retry__ && ({ seq__ = read_seqbegin(seql); true; }); \
-	     retry__ = read_seqretry((seql), seq__))
 
 static struct rpdfs_block *alloc_block(gfp_t gfp)
 {
