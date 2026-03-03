@@ -8,6 +8,7 @@ rpdfs-y	:= balloc.o \
 	   btree_txn.o \
 	   dir.o \
 	   file.o \
+	   ht.o \
 	   inode.o \
 	   map.o \
 	   mkfs.o \
