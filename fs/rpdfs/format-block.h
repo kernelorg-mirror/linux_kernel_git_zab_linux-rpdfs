@@ -224,6 +224,9 @@ struct rpdfs_xattr {
 	};
 };
 
+/* max xattr name length, without null term */
+#define	RPDFS_XATTR_MAX_NAME_LEN	RPDFS_NAME_MAX
+
 /*
  * Maximum size of the xattr struct plus non-null-terminated xattr
  * name/value (see xattr_size()).

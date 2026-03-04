@@ -17,6 +17,7 @@
 #include "net_tcp.h"
 #include "parse.h"
 #include "pr.h"
+#include "xattr.h"
 
 struct rpdfs_fs_context {
 	struct rpdfs_net_transport_addr source_addr;
@@ -42,7 +43,7 @@ static const struct super_operations rpdfs_sop = {
 static int rpdfs_set_super(struct super_block *sb, struct fs_context *fc)
 {
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
-	sb->s_xattr = NULL;
+	sb->s_xattr = rpdfs_xattr_handlers;
 	sb->s_op = &rpdfs_sop;
 	sb->s_time_gran = 1;
 	sb->s_time_min = 0;

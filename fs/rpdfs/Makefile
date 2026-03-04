@@ -16,4 +16,5 @@ rpdfs-y	:= balloc.o \
 	   parse.o \
 	   rht.o \
 	   super.o \
-	   txn.o
+	   txn.o \
+	   xattr.o

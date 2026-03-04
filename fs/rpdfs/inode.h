@@ -15,8 +15,12 @@ struct rpdfs_inode_info {
 	seqlock_t refresh_seqlock;
 	u64 refresh_wcount;
 
+	/* Uniquifier to avoid xattr name hash collisions */
+	__le64 xattr_creates;
+
 	struct rpdfs_ino_gen ig;
 	struct rpdfs_btree_root dirents;
+	struct rpdfs_btree_root xattrs;
 
 	struct inode vfs_inode;
 };

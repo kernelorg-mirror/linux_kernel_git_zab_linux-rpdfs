@@ -73,6 +73,9 @@ static void copy_rinode_to_vfs_inode(struct inode *inode, struct rpdfs_inode *ri
 	inode_set_mtime_to_ts(inode, ns_to_timespec64(le64_to_cpu(rinode->mtime_nsec)));
 
 	ri->dirents = rinode->dirents;
+
+	ri->xattrs = rinode->xattrs;
+	ri->xattr_creates = rinode->xattr_creates;
 }
 
 static __le64 cpu_ts64_to_le64_ns(struct timespec64 ts)
@@ -96,6 +99,9 @@ static void copy_vfs_inode_to_rinode(struct rpdfs_inode *rinode, struct inode *i
 	rinode->mtime_nsec = cpu_ts64_to_le64_ns(inode_get_mtime(inode));
 
 	rinode->dirents = ri->dirents;
+
+	rinode->xattrs = ri->xattrs;
+	rinode->xattr_creates = ri->xattr_creates;
 }
 
 /*
@@ -286,6 +292,7 @@ struct inode *rpdfs_new_inode(struct super_block *sb, struct rpdfs_ino_gen *ig)
 
 	ri = RPDFS_I(inode);
 	ri->refresh_wcount = 0;
+	ri->xattr_creates = 0;
 	ri->ig = *ig;
 	inode->i_ino = le64_to_cpu(ri->ig.ino);
 
