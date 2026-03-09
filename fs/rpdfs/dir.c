@@ -503,6 +503,48 @@ static int create_and_instantiate_new(struct mnt_idmap *idmap, struct inode *dir
 	return ret;
 }
 
+/*
+ * The VFS did a bunch of checks before calling our unlink
+ * implementation, but some other node could have made changes between
+ * then and now. The prepare functions only succeed if the inodes have
+ * not been freed or reused, the directory entry to be removed is still
+ * there, and there is no detected corruption (which is distinct from
+ * changes made by other nodes).
+ */
+static int prepare_unlink(struct inode *dir, struct inode *inode, struct dentry *dentry)
+{
+	int ret;
+
+	/* normal failures due to other nodes making changes */
+	if (S_ISDIR(inode->i_mode)) {
+		if (!is_dir_empty(inode)) {
+			ret = -ENOTEMPTY;
+			goto out;
+		}
+	}
+
+	/* consistency/corruption checks */
+	if (S_ISDIR(inode->i_mode)) {
+		if (inode->i_nlink != 2) {
+			pr_warn("empty dir ino %lu has bad n_link %d",
+				inode->i_ino, inode->i_nlink);
+			ret = -EUCLEAN;
+			goto out;
+		}
+	} else {
+		if (inode->i_nlink < 1) {
+			pr_warn("attempting to unlink ino %lu but n_link %d is already < 1",
+				inode->i_ino, inode->i_nlink);
+			ret = -EUCLEAN;
+			goto out;
+		}
+	}
+
+	ret = 0;
+out:
+	return ret;
+}
+
 static int rpdfs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry,
 			umode_t mode, bool excl)
 {
@@ -513,6 +555,62 @@ static struct dentry *rpdfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 				  struct dentry *dentry, umode_t mode)
 {
 	return ERR_PTR(create_and_instantiate_new(idmap, dir, dentry, S_IFDIR | mode));
+}
+
+static int rpdfs_unlink(struct inode *dir, struct dentry *dentry)
+{
+	struct rpdfs_fs_info *rfi = RPDFS_INODE_FS(dir);
+	struct inode *inode = d_inode(dentry);
+	struct key_dent *kd = NULL;
+	DECLARE_RPDFS_TXN(txn);
+	int ret;
+
+	kd = alloc_key_dent(dentry, inode);
+	if (!kd) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	/* prepare all the blocks for the txn */
+	do {
+		ret = rpdfs_inode_txn_prepare(rfi, &txn, dir, RBAF_WRITE) ?:
+		      rpdfs_inode_txn_prepare(rfi, &txn, inode, RBAF_WRITE) ?:
+		      prepare_remove_entry(rfi, &txn, dir, kd) ?:
+		      prepare_unlink(dir, inode, dentry);
+	} while (rpdfs_txn_retry(rfi, &txn, &ret));
+	if (ret < 0)
+		goto out;
+
+	/* apply changes to block structures */
+	apply_remove_entry(rfi, &txn, dir, kd);
+
+	/* update link count and metadata change time */
+	drop_nlink(inode);
+	if (S_ISDIR(inode->i_mode)) {
+		drop_nlink(dir);
+		drop_nlink(inode);
+	}
+	inode_set_ctime_current(inode);
+
+	/* update parent dir size and data/metadata times */
+	update_dir_size(dir, -(dentry->d_name.len + 1));
+	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
+
+	/* update block storage of vfs inodes */
+	rpdfs_inode_txn_update(rfi, &txn, dir);
+	rpdfs_inode_txn_update(rfi, &txn, inode);
+
+	ret = 0;
+out:
+	rpdfs_txn_reset(rfi, &txn);
+	kfree(kd);
+
+	return ret;
+}
+
+static int rpdfs_rmdir(struct inode *dir, struct dentry *dentry)
+{
+	return rpdfs_unlink(dir, dentry);
 }
 
 /*
@@ -714,6 +812,8 @@ const struct inode_operations rpdfs_dir_iops = {
 	.mkdir		= rpdfs_mkdir,
 	.rename		= rpdfs_rename,
 	.setattr	= rpdfs_setattr,
+	.unlink 	= rpdfs_unlink,
+	.rmdir 		= rpdfs_rmdir,
 };
 
 const struct file_operations rpdfs_dir_fops = {
