@@ -294,6 +294,9 @@ struct inode *rpdfs_new_inode(struct super_block *sb, struct rpdfs_ino_gen *ig)
 	ri->refresh_wcount = 0;
 	ri->xattr_creates = 0;
 	ri->ig = *ig;
+	ri->dirents.height = 0;
+	ri->dirents.ref.bnr = 0;
+	ri->dirents.ref.alloc_counter = 0;
 	inode->i_ino = le64_to_cpu(ri->ig.ino);
 
 	ret = insert_inode_locked4(inode, ig_hashval(ig), rpdfs_iget_test, ig);
