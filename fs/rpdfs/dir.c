@@ -363,6 +363,26 @@ static struct key_dent *alloc_key_dent(struct dentry *dentry, struct inode *inod
 	return kd;
 }
 
+static void init_dir_size(struct inode *inode)
+{
+	i_size_write(inode, RPDFS_EMPTY_DIR_LEN);
+}
+
+static int is_dir_empty(struct inode *inode)
+{
+	return (i_size_read(inode) == RPDFS_EMPTY_DIR_LEN);
+}
+
+/*
+ * Helper function for readability. All consistency/corruption checks
+ * should happen in the prepare phase, so there are no checks when
+ * making changes.
+ */
+static void update_dir_size(struct inode *inode, s32 len)
+{
+	i_size_write(inode, i_size_read(inode) + len);
+}
+
 /*
  * Allocate an inode in a block transaction and return an allocated vfs
  * inode at its ino/gen position.  Like _iget, this inserts an I_NEW
@@ -429,17 +449,21 @@ static struct inode *create_new_inode(struct mnt_idmap *idmap, struct inode *dir
 
 	/* update vfs inodes */
 	inode_init_owner(idmap, inode, dir, mode);
-	if (S_ISDIR(mode))
+	if (S_ISDIR(mode)) {
 		set_nlink(inode, 2);
-	else
+		init_dir_size(inode);
+	} else {
 		set_nlink(inode, 1);
+	}
+
 	rpdfs_inode_init_ops(inode);
 
+	/* update parent vfs inode and apply changes to referenced blocks */
 	if (S_ISDIR(mode))
 		inc_nlink(dir);
 
-	/* apply changes to referenced blocks */
 	if (kd) {
+		update_dir_size(dir, kd->dent.name_len + 1);
 		kd->dent.ig = ig;
 		apply_add_entry(rfi, &txn, dir, kd);
 	}
@@ -532,7 +556,7 @@ static int rpdfs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct d
 		goto out;
 	}
 
-	/* prepare all the blocks for in the txn */
+	/* prepare all the blocks for the txn */
 	do {
 		ret = rpdfs_inode_txn_prepare(rfi, &txn, old_dir, RBAF_WRITE) ?:
 		      rpdfs_inode_txn_prepare(rfi, &txn, old_inode, RBAF_WRITE) ?:
@@ -551,6 +575,11 @@ static int rpdfs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct d
 	if (ret < 0)
 		goto out;
 
+	/*
+	 * TODO: walk ancestors, and if there is a directory to be
+	 * deleted, check if it is empty.
+	 */
+
 	/* apply changes to block structures */
 	apply_remove_entry(rfi, &txn, old_dir, old_kd);
 	if (new_inode)
@@ -558,11 +587,12 @@ static int rpdfs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct d
 	else
 		apply_add_entry(rfi, &txn, new_dir, new_kd);
 
-	/* update vfs inodes: first dir sizes .. */
-	i_size_write(old_dir, i_size_read(old_dir) - old_dentry->d_name.len);
+	/* update dir sizes */
+	update_dir_size(old_dir, -(old_dentry->d_name.len + 1));
 	if (!new_inode)
-               i_size_write(new_dir, i_size_read(new_dir) + new_dentry->d_name.len);
-	/* .. then link counts .. */
+		update_dir_size(new_dir, new_dentry->d_name.len + 1);
+
+	/* and link counts */
 	if (new_inode) {
 		drop_nlink(new_inode);
 		if (S_ISDIR(new_inode->i_mode)) {
@@ -570,10 +600,12 @@ static int rpdfs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct d
 			drop_nlink(new_inode);
 		}
 	}
+
 	if (S_ISDIR(old_inode->i_mode) && (old_dir != new_dir)) {
 		drop_nlink(old_dir);
 		inc_nlink(new_dir);
 	}
+
 	/* .. and finally times */
 	now = inode_set_ctime_current(old_dir);
 	inode_set_mtime_to_ts(old_dir, now);

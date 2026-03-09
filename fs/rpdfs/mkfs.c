@@ -45,7 +45,7 @@ int rpdfs_mkfs(struct rpdfs_fs_info *rfi)
 
 	rinode->ig.ino = cpu_to_le64(RPDFS_ROOT_INO);
 	rinode->ig.gen = cpu_to_le64(RPDFS_ROOT_GEN);
-	rinode->size = cpu_to_le64(5); /* name lens of . and .. with null term */
+	rinode->size = cpu_to_le64(RPDFS_EMPTY_DIR_LEN);
 	rinode->version = cpu_to_le64(1);
 	rinode->nlink = cpu_to_le32(2);
 	rinode->mode = cpu_to_le32(S_IFDIR | 0755);

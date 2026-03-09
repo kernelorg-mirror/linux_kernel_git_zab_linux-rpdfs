@@ -211,6 +211,14 @@ struct rpdfs_dirent {
 #define RPDFS_DIRENT_MIN_HASH		2ULL
 
 /*
+ * An empty dir contains pseudo entries for "." and "..". The reported
+ * size of directory is the length of the null-terminated names of all
+ * the directory entries. (The actual size is the number of blocks
+ * necessary to store the dirents btree.)
+ */
+#define RPDFS_EMPTY_DIR_LEN	5
+
+/*
  * xattrs are currently implemented as btree items, whose keys are the
  * hash of the name combined with the xattr_create_counter value in the
  * inode, which makes the keys unique - no collisions.
