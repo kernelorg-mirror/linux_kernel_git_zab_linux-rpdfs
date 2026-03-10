@@ -20,7 +20,9 @@
 #include "xattr.h"
 
 struct rpdfs_fs_context {
-	struct rpdfs_net_transport_addr source_addr;
+	/* XXX arbitrary limit on number of addrs */
+	struct rpdfs_net_transport_addr devd_addrs[16];
+	size_t nr_addrs;
 	bool mkfs;
 };
 
@@ -76,6 +78,20 @@ static int rpdfs_setup(struct rpdfs_fs_info *rfi)
 	return ret;
 }
 
+static int add_devd_addrs(struct rpdfs_fs_info *rfi, struct rpdfs_fs_context *rfc)
+{
+	size_t i;
+	int ret;
+
+	for (i = 0; i < rfc->nr_addrs; i++) {
+		ret = rpdfs_map_add_addr(rfi, &rfc->devd_addrs[i]);
+		if (ret < 0)
+			break;
+	}
+
+	return ret;
+}
+
 static int rpdfs_get_tree(struct fs_context *fc)
 {
 	static struct rpdfs_ino_gen root_ig = {
@@ -106,11 +122,12 @@ static int rpdfs_get_tree(struct fs_context *fc)
 	}
 
 	/*
-	 * XXX We hack together an analog of a map with a single devd
-	 * address instead of connecting to mapd to get the real maps.
+	 * XXX We hack together an analog of a map with the devd
+	 * addresses instead of connecting to a quorumd to get devd
+	 * addresses from the devd qlist.
 	 */
 	ret = rpdfs_setup(rfi) ?:
-	      rpdfs_map_add_addr(rfi, &rfc->source_addr) ?:
+	      add_devd_addrs(rfi, rfc) ?:
 	      rpdfs_map_connect(rfi);
 	if (ret < 0)
 		goto out;
@@ -147,15 +164,37 @@ out:
 }
 
 enum {
+	Opt_devd_addr,
 	Opt_mkfs,
 	Opt_source,
 };
 
 static const struct fs_parameter_spec rpdfs_mount_parameters[] = {
+	fsparam_string	("devd_addr",			Opt_devd_addr),
 	fsparam_flag	("mkfs",			Opt_mkfs),
 	fsparam_string	("source",			Opt_source),
 	{}
 };
+
+static int parse_devd_addr(struct fs_context *fc, struct rpdfs_fs_context *rfc, char *str)
+{
+	int ret;
+
+	if (rfc->nr_addrs >= ARRAY_SIZE(rfc->devd_addrs))
+		return invalfc(fc, "too many addresses given, %zu supported.",
+			       ARRAY_SIZE(rfc->devd_addrs));
+
+	ret = rpdfs_parse_ipv4(str, &rfc->devd_addrs[rfc->nr_addrs]._sin);
+	if (ret < 0) {
+		if (ret == -EINVAL)
+			return invalfc(fc, "Invalid ipv4 addr:port");
+		else
+			return invalfc(fc, "Error parsing ipv4 addr:port: %d", ret);
+	}
+
+	rfc->nr_addrs++;
+	return 0;
+}
 
 static int rpdfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 {
@@ -169,16 +208,15 @@ static int rpdfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		return token;
 
 	switch (token) {
+	case Opt_devd_addr:
+		ret = parse_devd_addr(fc, rfc, param->string);
+		break;
 	case Opt_mkfs:
 		rfc->mkfs = true;
 		break;
 	case Opt_source:
-		if (rfc->source_addr.sa.sa_family != AF_UNSPEC)
-			return invalfc(fc, "Multiple sources specified");
-		ret = rpdfs_parse_ipv4(param->string, &rfc->source_addr._sin);
-		if (ret == -EINVAL)
-			return invalfc(fc, "Invalid ipv4 addr:port");
-		else if (ret == 0) {
+		ret = parse_devd_addr(fc, rfc, param->string);
+		if (ret == 0) {
 			fc->source = param->string;
 			param->string = NULL;
 		}
@@ -213,8 +251,6 @@ static int rpdfs_init_fs_context(struct fs_context *fc)
 		ret = -ENOMEM;
 		goto out;
 	}
-
-	rfc->source_addr.sa.sa_family = AF_UNSPEC;
 
 	fc->fs_private = rfc;
 	fc->ops = &rpdfs_context_ops;
