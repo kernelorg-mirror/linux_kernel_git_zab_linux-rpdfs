@@ -281,6 +281,7 @@ out:
 struct inode *rpdfs_new_inode(struct super_block *sb, struct rpdfs_ino_gen *ig)
 {
 	struct rpdfs_inode_info *ri;
+	struct timespec64 ts;
 	struct inode *inode;
 	int ret;
 
@@ -298,6 +299,10 @@ struct inode *rpdfs_new_inode(struct super_block *sb, struct rpdfs_ino_gen *ig)
 	ri->dirents.ref.bnr = 0;
 	ri->dirents.ref.alloc_counter = 0;
 	inode->i_ino = le64_to_cpu(ri->ig.ino);
+
+	ts = inode_set_ctime_current(inode);
+	inode_set_mtime_to_ts(inode, ts);
+	inode_set_atime_to_ts(inode, ts);
 
 	ret = insert_inode_locked4(inode, ig_hashval(ig), rpdfs_iget_test, ig);
 	if (ret < 0) {
