@@ -57,6 +57,14 @@
 static struct rpdfs_btree_key min_key = { 0, 0 };
 static struct rpdfs_btree_key max_key = { cpu_to_le64(U64_MAX), cpu_to_le64(U64_MAX) };
 
+/* Initialize an empty btree root */
+void rpdfs_btree_root_init(struct rpdfs_btree_root *root)
+{
+	root->height = 0;
+	root->ref.bnr = 0;
+	root->ref.alloc_counter = 0;
+}
+
 /*
  * Callers incrementally modify the block before it's written.  We don't
  * want to write old kernel memory as block contents so we explicitly

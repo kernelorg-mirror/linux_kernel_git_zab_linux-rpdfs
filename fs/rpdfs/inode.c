@@ -6,6 +6,7 @@
 #include <linux/writeback.h>
 #include <linux/iversion.h>
 
+#include "btree.h"
 #include "dir.h"
 #include "file.h"
 #include "inode.h"
@@ -295,10 +296,10 @@ struct inode *rpdfs_new_inode(struct super_block *sb, struct rpdfs_ino_gen *ig)
 	ri->refresh_wcount = 0;
 	ri->xattr_creates = 0;
 	ri->ig = *ig;
-	ri->dirents.height = 0;
-	ri->dirents.ref.bnr = 0;
-	ri->dirents.ref.alloc_counter = 0;
 	inode->i_ino = le64_to_cpu(ri->ig.ino);
+
+	rpdfs_btree_root_init(&ri->dirents);
+	rpdfs_btree_root_init(&ri->xattrs);
 
 	ts = inode_set_ctime_current(inode);
 	inode_set_mtime_to_ts(inode, ts);

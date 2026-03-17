@@ -25,6 +25,8 @@ typedef int (*rpdfs_btree_item_cb_t)(struct rpdfs_fs_info *rfi, struct rpdfs_btr
 				     struct rpdfs_btree_item_args *b,
 				     struct rpdfs_btree_item_args *c, void *fn_arg);
 
+void rpdfs_btree_root_init(struct rpdfs_btree_root *root);
+
 void rpdfs_btree_init_first_block(struct rpdfs_btree_root *root, struct rpdfs_block_ref *ref,
 				  struct rpdfs_btree_block *bt);
 
