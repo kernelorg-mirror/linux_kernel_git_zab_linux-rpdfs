@@ -18,6 +18,9 @@ struct rpdfs_inode_info {
 	/* Uniquifier to avoid xattr name hash collisions */
 	__le64 xattr_creates;
 
+	/* Creation time is not tracked in VFS inode, do it here */
+	__le64 crtime_nsec;
+
 	struct rpdfs_ino_gen ig;
 	struct rpdfs_btree_root dirents;
 	struct rpdfs_btree_root xattrs;

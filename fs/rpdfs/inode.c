@@ -72,6 +72,7 @@ static void copy_rinode_to_vfs_inode(struct inode *inode, struct rpdfs_inode *ri
 	inode_set_atime_to_ts(inode, ns_to_timespec64(le64_to_cpu(rinode->atime_nsec)));
 	inode_set_ctime_to_ts(inode, ns_to_timespec64(le64_to_cpu(rinode->ctime_nsec)));
 	inode_set_mtime_to_ts(inode, ns_to_timespec64(le64_to_cpu(rinode->mtime_nsec)));
+	ri->crtime_nsec = rinode->crtime_nsec;
 
 	ri->dirents = rinode->dirents;
 
@@ -98,6 +99,7 @@ static void copy_vfs_inode_to_rinode(struct rpdfs_inode *rinode, struct inode *i
 	rinode->atime_nsec = cpu_ts64_to_le64_ns(inode_get_atime(inode));
 	rinode->ctime_nsec = cpu_ts64_to_le64_ns(inode_get_ctime(inode));
 	rinode->mtime_nsec = cpu_ts64_to_le64_ns(inode_get_mtime(inode));
+	rinode->crtime_nsec = ri->crtime_nsec;
 
 	rinode->dirents = ri->dirents;
 
@@ -304,6 +306,7 @@ struct inode *rpdfs_new_inode(struct super_block *sb, struct rpdfs_ino_gen *ig)
 	ts = inode_set_ctime_current(inode);
 	inode_set_mtime_to_ts(inode, ts);
 	inode_set_atime_to_ts(inode, ts);
+	ri->crtime_nsec = cpu_ts64_to_le64_ns(ts);
 
 	ret = insert_inode_locked4(inode, ig_hashval(ig), rpdfs_iget_test, ig);
 	if (ret < 0) {
