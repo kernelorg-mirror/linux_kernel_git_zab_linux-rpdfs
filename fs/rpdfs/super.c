@@ -26,6 +26,17 @@ struct rpdfs_fs_context {
 	bool mkfs;
 };
 
+static int rpdfs_sync_fs(struct super_block *sb, int wait)
+{
+	struct rpdfs_fs_info *rfi = RPDFS_SB_FS(sb);
+
+	rpdfs_prd("wait %d", wait);
+
+	rpdfs_block_sync(rfi, wait);
+
+	return 0;
+}
+
 static int rpdfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 {
 	buf->f_type = RPDFS_SUPER_MAGIC;
@@ -38,6 +49,7 @@ static int rpdfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 static const struct super_operations rpdfs_sop = {
 	.alloc_inode	= rpdfs_alloc_inode,
 	.free_inode	= rpdfs_free_inode,
+	.sync_fs	= rpdfs_sync_fs,
 	.statfs		= rpdfs_statfs,
 	.write_inode	= rpdfs_write_inode,
 };
