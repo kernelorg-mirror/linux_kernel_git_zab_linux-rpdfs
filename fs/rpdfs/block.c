@@ -322,19 +322,20 @@ static struct rpdfs_block *alloc_block(bool with_page, gfp_t gfp)
 		goto out;
 	}
 
-	if (with_page) {
-		ret = alloc_data_page(bk, gfp);
-		if (ret < 0) {
-			bk = ERR_PTR(ret);
-			goto out;
-		}
-	}
-
 	INIT_LIST_HEAD(&bk->lru_head);
 	atomic64_set(&bk->refcount, 0);
 	seqlock_init(&bk->seqlock);
 	init_waitqueue_head(&bk->waitq);
 	INIT_LIST_HEAD(&bk->dirty_head);
+
+	if (with_page) {
+		ret = alloc_data_page(bk, gfp);
+		if (ret < 0) {
+			kfree(bk);
+			bk = ERR_PTR(ret);
+			goto out;
+		}
+	}
 out:
 	return bk;
 }
