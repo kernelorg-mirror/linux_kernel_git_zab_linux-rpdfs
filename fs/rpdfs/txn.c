@@ -444,6 +444,7 @@ int rpdfs_txn_use_prepared(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *
 
 	tblk = get_tblk(&txn->blocks, bnr, 0, false);
 	if (WARN_ON_ONCE(IS_ERR_OR_NULL(tblk))) {
+		rpdfs_prd("bnr %llu", bnr);
 		ret = -EINVAL;
 		goto out;
 	}
