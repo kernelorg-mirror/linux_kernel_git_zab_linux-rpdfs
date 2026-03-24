@@ -54,6 +54,13 @@ enum {
 	 * cached, writable, and free.
 	 */
 	_RBAF_ALLOC,
+
+	/*
+	 * Only acquires blocks that are already dirty.  Returns
+	 * -ENODATA if no block was cached or the cached block wasn't
+	 * dirty.
+	 */
+	_RBAF_ALREADY_DIRTY,
 };
 
 #define RBAF_WRITE		((__force rbaf_t)BIT(_RBAF_WRITE))
@@ -61,6 +68,7 @@ enum {
 #define RBAF_NONBLOCK_MODE	((__force rbaf_t)BIT(_RBAF_NONBLOCK_MODE))
 #define RBAF_NONBLOCK_FLUSH	((__force rbaf_t)BIT(_RBAF_NONBLOCK_FLUSH))
 #define RBAF_ALLOC		((__force rbaf_t)BIT(_RBAF_ALLOC))
+#define RBAF_ALREADY_DIRTY	((__force rbaf_t)BIT(_RBAF_ALREADY_DIRTY))
 
 /*
  * Shared read or exclusive write handles are acquired in the form of

@@ -1140,7 +1140,7 @@ int rpdfs_block_acquire(struct rpdfs_fs_info *rfi, u64 bnr, struct rpdfs_block_h
 		goto out;
 	}
 
-	if ((rbaf & RBAF_ALLOC)) {
+	if ((rbaf & (RBAF_ALLOC | RBAF_ALREADY_DIRTY))) {
 		bk = lookup_block(binf, bnr);
 		if (!bk)
 			bk = ERR_PTR(-ENODATA);
@@ -1177,6 +1177,9 @@ int rpdfs_block_acquire(struct rpdfs_fs_info *rfi, u64 bnr, struct rpdfs_block_h
 			     !dirty_within_flush(binf, bk) &&
 			     alloc_ctr_is_free(bk->hnd.alloc_ctr))) {
 			/* only satisfy allocs from idle write mode free blocks */
+			ret = -ENODATA;
+
+		} else if ((rbaf & RBAF_ALREADY_DIRTY) && !bk->dirty) {
 			ret = -ENODATA;
 
 		} else if ((mode > bk->grant_mode) || (
