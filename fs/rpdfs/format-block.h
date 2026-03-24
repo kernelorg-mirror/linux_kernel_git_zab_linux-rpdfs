@@ -200,32 +200,20 @@ struct rpdfs_dirent {
 	};
 };
 
+/* size of the dirent struct stored in the item before the name */
+#define RPDFS_DIRENT_SIZEOF offsetof(struct rpdfs_dirent, name)
+
 /* max dirent name length, without null term */
 #define RPDFS_NAME_MAX	255
-
-/* dirents must have at least 1 name byte */
-#define RPDFS_DIRENT_MIN_VAL_SIZE offsetof(struct rpdfs_dirent, name[1])
 
 /* just a random value */
 #define RPDFS_DIRENT_HASH_SEED	0xce94cad8f038f79a
 
-/*
- * The low bit of the dirent key value (and readdir pos) is manually
- * assigned to handle colliding name hash values.  We don't want the
- * unlikely event of a single hash collision to prevent creation.
- */
-#define RPDFS_DIRENT_COLL_BIT	1ULL
-
-/*
- * We clear the high bit to avoid signed long telldir/seekdir and
- * initially clear the collision bits.
- */
-#define RPDFS_DIRENT_HASH_MASK	(U64_MAX ^ (1ULL << 63) ^ RPDFS_DIRENT_COLL_BIT)
-
 /* reserved hash values for . and .. */
 #define RPDFS_DIRENT_DOT_HASH	 	0ULL
 #define RPDFS_DIRENT_DOT_DOT_HASH	1ULL
-#define RPDFS_DIRENT_MIN_HASH		2ULL
+/* the btree clears collision bits so we must use a min past them */
+#define RPDFS_DIRENT_MIN_HASH		(RPDFS_BTREE_KEY_COLL_MASK + 1)
 
 /*
  * An empty dir contains pseudo entries for "." and "..". The reported

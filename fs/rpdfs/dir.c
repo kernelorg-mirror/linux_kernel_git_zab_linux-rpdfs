@@ -7,64 +7,25 @@
 
 #include "balloc.h"
 #include "btree_txn.h"
+#include "compare.h"
 #include "dir.h"
 #include "format-block.h"
 #include "inode.h"
 
 /*
- * A little container to describe a dirent.
- *
- * Sometimes they're allocated contiguously with the name following the
- * dirent so they can be copied into a dirent btree item.  Sometimes
- * they're on the stack and the name points to a name argument in the
- * caller.  So kd->{name,dent.name} should be used carefully.
+ * A collection of the arguments that describe a directory entry for
+ * item callbacks.  It matters mostly for rename which juggles
+ * combinations of multiple dirs, names, and inodes.  These are
+ * initialized from the caller's input, typically a dentry.  Our dent
+ * can be prepared from args for writing into blocks or can be read from
+ * blocks and returned.
  */
-struct key_dent {
-	struct rpdfs_btree_key key;
+struct dent_cb_args {
+	u64 key;
 	const char *name;
+	unsigned name_len;
 	struct rpdfs_dirent dent;
 };
-
-/*
- * Return the name hash, masking off the low collision bit.
- */
-static u64 dent_key_hash(struct rpdfs_btree_key *key)
-{
-	return le64_to_cpu(key->msq) & ~RPDFS_DIRENT_COLL_BIT;
-}
-
-static void init_dent_key(struct rpdfs_btree_key *key, u64 hash)
-{
-	key->msq = cpu_to_le64(hash);
-	key->lsq = 0;
-}
-
-/*
- * Return unpadded bytes used by the dirent struct and its embedded name (no null term).
- */
-static unsigned dent_size(unsigned name_len)
-{
-	return offsetof(struct rpdfs_dirent, name[name_len]);
-}
-
-static bool names_match(const char *a, unsigned a_len, const char *b, unsigned b_len)
-{
-	return a_len == b_len && memcmp(a, b, a_len) == 0;
-}
-
-static bool item_name_matches(struct rpdfs_btree_item_args *bti, const char *name,
-			      unsigned name_len)
-{
-	struct rpdfs_dirent *dent = (void *)bti->val;
-
-	return names_match(dent->name, dent->name_len, name, name_len);
-}
-
-static bool item_hash_and_name_matches(struct rpdfs_btree_item_args *bti, struct key_dent *kd)
-{
-	return dent_key_hash(&bti->key) == dent_key_hash(&kd->key) &&
-	       item_name_matches(bti, kd->name, kd->dent.name_len);
-}
 
 /*
  * The directory entries for . and .. are generated during lookup and
@@ -89,7 +50,7 @@ static u64 name_hash(const char *name, size_t name_len)
 			return RPDFS_DIRENT_DOT_DOT_HASH;
 	}
 
-	hash = xxh64(name, name_len, RPDFS_DIRENT_HASH_SEED) & RPDFS_DIRENT_HASH_MASK;
+	hash = xxh64(name, name_len, RPDFS_DIRENT_HASH_SEED) & RPDFS_BTREE_ITEM_KEY_MASK;
 
 	if (hash < RPDFS_DIRENT_MIN_HASH)
 		hash = RPDFS_DIRENT_MIN_HASH;
@@ -97,88 +58,122 @@ static u64 name_hash(const char *name, size_t name_len)
 	return hash;
 }
 
-static void init_key_dent(struct key_dent *kd, const char *name, size_t name_len,
-			  struct rpdfs_ino_gen *ig, bool copy_contig_name)
+static void init_dent_cb_args(struct dent_cb_args *da, struct dentry *dentry, struct inode *inode)
 {
-	BUG_ON(name_len == 0 || name_len > RPDFS_NAME_MAX);
+	BUG_ON(dentry->d_name.len == 0 || dentry->d_name.len > RPDFS_NAME_MAX);
 
-	init_dent_key(&kd->key, name_hash(name, name_len));
-	if (ig)
-		kd->dent.ig = *ig;
+	/* args used by functions */
+	da->name = dentry->d_name.name;
+	da->name_len = dentry->d_name.len;
+	da->key = name_hash(da->name, da->name_len);
+
+	/* initialize dent if used as input, might later clobbered for output */
+	da->dent.name_len = da->name_len;
+	if (inode)
+		da->dent.ig = *rpdfs_inode_ig(inode);
 	else
-		kd->dent.ig = (struct rpdfs_ino_gen) { 0, };
-	kd->dent.name_len = name_len;
-	if (copy_contig_name) {
-		memcpy(&kd->dent.name[0], name, name_len);
-		kd->name = (char *)kd->dent.name;
-	} else {
-		kd->name = name;
-	}
+		da->dent.ig = (struct rpdfs_ino_gen) { 0, };
 }
 
-/*
- * We're looking up the key with the hash of the name without the
- * collision bit.  If the dirent exists then it can only be in the next
- * two items if they match the hash, without and with the collision bit.
- */
-static int lookup_item_cb(struct rpdfs_fs_info *rfi, struct rpdfs_btree_item_args *a,
-			  struct rpdfs_btree_item_args *b, struct rpdfs_btree_item_args *c,
-			  void *arg)
+static bool bad_dent_item(struct rpdfs_dirent *dent, u16 val_size)
 {
-	struct key_dent *kd = arg;
-	struct rpdfs_btree_item_args *match = NULL;
-	struct rpdfs_dirent *dent;
-	int ret;
-
-	if (a && item_hash_and_name_matches(a, kd))
-		match = a;
-	else if (b && item_hash_and_name_matches(b, kd))
-		match = b;
-
-	if (match) {
-		dent = (void *)match->val;
-		kd->dent.ig = dent->ig;
-		ret = 0;
-	} else {
-		ret = -ENOENT;
-	}
-
-	return ret;
+	return val_size < RPDFS_DIRENT_SIZEOF ||
+	       val_size < offsetof(struct rpdfs_dirent, name[dent->name_len]);
 }
 
-/*
- * Search the dirents in the dir for the given name.  If it's found
- * return 0 and set the caller's ig to the found dent's ig.  Returns
- * -ENOENT if the name wasn't found.
- */
-static int lookup_name(struct rpdfs_fs_info *rfi, struct inode *dir, const char *name,
-		       size_t name_len, struct rpdfs_ino_gen *ig)
+static int match_dent_cb(struct rpdfs_fs_info *rfi, u64 key, void *val, u16 val_size, void *arg)
 {
+	struct dent_cb_args *da = arg;
+	struct rpdfs_dirent *dent = val;
 
-	DECLARE_RPDFS_TXN(txn);
-	struct key_dent kd;
+	if (bad_dent_item(dent, val_size))
+		return -EUCLEAN;
+
+	if (rpdfs_names_match(da->name, da->name_len, dent->name, dent->name_len))
+		return 0;
+
+	return -ELOOP;
+}
+
+static int copy_dent_cb(struct rpdfs_fs_info *rfi, u64 key, void *val, u16 val_size, void *arg)
+{
+	struct dent_cb_args *da = arg;
+	struct rpdfs_dirent *dent = val;
 	int ret;
 
-	init_key_dent(&kd, name, name_len, NULL, false);
-
-	do {
-		ret = rpdfs_inode_txn_prepare(rfi, &txn, dir, 0) ?:
-		      rpdfs_btree_txn_prepare_lookup(rfi, &txn, &RPDFS_I(dir)->dirents,
-						     &kd.key, lookup_item_cb, &kd);
-	} while (rpdfs_txn_retry(rfi, &txn, &ret));
-
+	ret = match_dent_cb(rfi, key, val, val_size, arg);
 	if (ret == 0)
-		*ig = kd.dent.ig;
-
-	rpdfs_txn_reset(rfi, &txn);
+		memcpy(&da->dent, dent, RPDFS_DIRENT_SIZEOF);
 	return ret;
+}
+
+static int lookup_entry(struct rpdfs_fs_info *rfi, struct inode *dir, struct dent_cb_args *da)
+{
+	struct rpdfs_inode_info *ri = RPDFS_I(dir);
+
+	return rpdfs_btree_lookup(rfi, &ri->dirents, da->key, copy_dent_cb, da);
+}
+
+static int insert_dent_cb(struct rpdfs_fs_info *rfi, u64 key, void *val, u16 val_size, void *arg)
+{
+	int ret = match_dent_cb(rfi, key, val, val_size, arg);
+	if (ret == 0)
+		ret = -EEXIST;
+	return ret;
+}
+
+static int insert_entry(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
+			struct inode *dir, struct dent_cb_args *da)
+{
+	struct rpdfs_inode_info *ri = RPDFS_I(dir);
+	struct kvec kv[2] = {
+		{ .iov_base = &da->dent, .iov_len = RPDFS_DIRENT_SIZEOF },
+		{ .iov_base = (void *)da->name, .iov_len = da->name_len },
+	};
+
+	return rpdfs_btree_insert(rfi, txn, &ri->dirents, da->key, insert_dent_cb, da,
+				  kv, ARRAY_SIZE(kv));
+}
+
+static int modify_dent_cb(struct rpdfs_fs_info *rfi, u64 key, void *val, u16 val_size, void *arg)
+{
+	struct dent_cb_args *da = arg;
+	struct rpdfs_dirent *dent = val;
+	int ret;
+
+	ret = match_dent_cb(rfi, key, val, val_size, arg);
+	if (ret == 0) {
+		dent->pers_dtype = da->dent.pers_dtype;
+		dent->ig = da->dent.ig;
+	}
+	return ret;
+}
+
+/*
+ * Modification is used to update the target inode of an existing dent.
+ */
+static int modify_entry(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
+			struct inode *dir, struct dent_cb_args *da)
+{
+	struct rpdfs_inode_info *ri = RPDFS_I(dir);
+
+	return rpdfs_btree_modify(rfi, txn, &ri->dirents, da->key, modify_dent_cb, da);
+}
+
+static int delete_entry(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
+			struct inode *dir, struct dent_cb_args *da)
+{
+	struct rpdfs_inode_info *ri = RPDFS_I(dir);
+
+	return rpdfs_btree_delete(rfi, txn, &ri->dirents, da->key, match_dent_cb, da);
 }
 
 static struct dentry *rpdfs_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
 {
 	struct super_block *sb = dir->i_sb;
 	struct rpdfs_fs_info *rfi = RPDFS_INODE_FS(dir);
-	struct rpdfs_ino_gen ig;
+	struct rpdfs_block_handle *hnd = NULL;
+	struct dent_cb_args da;
 	struct inode *inode;
 	int ret;
 
@@ -187,7 +182,14 @@ static struct dentry *rpdfs_lookup(struct inode *dir, struct dentry *dentry, uns
 		goto out;
 	}
 
-	ret = lookup_name(rfi, dir, dentry->d_name.name, dentry->d_name.len, &ig);
+	init_dent_cb_args(&da, dentry, NULL);
+
+	ret = rpdfs_inode_acquire(rfi, dir, &hnd, 0);
+	if (ret < 0)
+		goto out;
+
+	ret = lookup_entry(rfi, dir, &da);
+	rpdfs_block_release(rfi, &hnd);
 	if (ret < 0 && ret != -ENOENT) {
 		inode = ERR_PTR(ret);
 		goto out;
@@ -196,171 +198,11 @@ static struct dentry *rpdfs_lookup(struct inode *dir, struct dentry *dentry, uns
 	if (ret == -ENOENT)
 		inode = NULL;
 	else
-		inode = rpdfs_iget(sb, &ig);
+		inode = rpdfs_iget(sb, &da.dent.ig);
 
 out:
 	/* d_splice_alias passes through ERR_PTR inodes */
 	return d_splice_alias(inode, dentry);
-}
-
-/*
- * Examine existing items to decide if we can insert a new dirent.
- * Either both or b can be null.
- *
- * If either item has a matching hash and name then we return eexist.
- * If both items have matching hashes then we've run out of room for a
- * new item.
- *
- * XXX rename within a directory can be removing an existing item with a
- * colliding hash value.  We'd want to account for that to avoid an
- * (unlikely) spurious enospc.
- *
- * Returns error to abort or 0 with the insert args set to describe the
- * item to insert.
- */
-static int add_entry_item_cb(struct rpdfs_fs_info *rfi, struct rpdfs_btree_item_args *a,
-			     struct rpdfs_btree_item_args *b, struct rpdfs_btree_item_args *ins,
-			     void *arg)
-{
-	struct key_dent *kd = arg;
-
-	ins->key = kd->key;
-
-	if (a && dent_key_hash(&kd->key) == dent_key_hash(&a->key)) {
-		if (item_name_matches(a, kd->name, kd->dent.name_len))
-			return -EEXIST;
-
-		if (b && dent_key_hash(&kd->key) == dent_key_hash(&b->key)) {
-			if (item_name_matches(a, kd->name, kd->dent.name_len))
-				return -EEXIST;
-			return -ENOSPC;
-		}
-
-		ins->key.msq = a->key.msq ^ cpu_to_le64(RPDFS_DIRENT_COLL_BIT);
-	}
-
-	ins->val = &kd->dent;
-	ins->val_size = dent_size(kd->dent.name_len);
-
-	return 0;
-}
-
-/*
- * We use one has collision bit so we only have to test two items at
- * most.
- */
-static int remove_entry_item_cb(struct rpdfs_fs_info *rfi, struct rpdfs_btree_item_args *a,
-				struct rpdfs_btree_item_args *b, struct rpdfs_btree_item_args *c,
-				void *arg)
-{
-	struct key_dent *kd = arg;
-
-	if (a && item_hash_and_name_matches(a, kd))
-		return 0;
-	else if (b && item_hash_and_name_matches(b, kd))
-		return 1;
-	else
-		return -ENOENT;
-}
-
-/*
- * Modification is used to rewrite the target inode of the dent.  We
- * re-use the removal pair fn to discover which item to modify.
- */
-static int modify_entry_item_cb(struct rpdfs_fs_info *rfi, struct rpdfs_btree_item_args *a,
-				struct rpdfs_btree_item_args *b, struct rpdfs_btree_item_args *c,
-				void *arg)
-{
-	struct key_dent *kd = arg;
-	struct rpdfs_btree_item_args *mod;
-	struct rpdfs_dirent *dent;
-	int ret;
-
-	ret = remove_entry_item_cb(rfi, a, b, c, arg);
-	if (ret < 0)
-		return ret;
-
-	mod = ret == 0 ? a : b;
-	dent = mod->val;
-	dent->ig = kd->dent.ig;
-	dent->pers_dtype = kd->dent.pers_dtype;
-
-	return 0;
-}
-
-static int prepare_add_entry(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
-				struct inode *dir, struct key_dent *kd)
-{
-	struct rpdfs_inode_info *ri = RPDFS_I(dir);
-
-	return rpdfs_btree_txn_prepare_insert(rfi, txn, &ri->dirents, &kd->key,
-					      dent_size(kd->dent.name_len),
-					      add_entry_item_cb, kd);
-}
-
-static int apply_add_entry(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
-			   struct inode *dir, struct key_dent *kd)
-{
-	struct rpdfs_inode_info *ri = RPDFS_I(dir);
-
-	return rpdfs_btree_txn_apply_insert(rfi, txn, &ri->dirents, &kd->key,
-					    dent_size(kd->dent.name_len),
-					    add_entry_item_cb, kd);
-}
-
-static int prepare_remove_entry(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
-				struct inode *dir, struct key_dent *kd)
-{
-	struct rpdfs_inode_info *ri = RPDFS_I(dir);
-
-	return rpdfs_btree_txn_prepare_delete(rfi, txn, &ri->dirents, &kd->key,
-					      dent_size(kd->dent.name_len),
-					      remove_entry_item_cb, kd);
-}
-
-static int apply_remove_entry(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
-			      struct inode *dir, struct key_dent *kd)
-{
-	struct rpdfs_inode_info *ri = RPDFS_I(dir);
-
-	return rpdfs_btree_txn_apply_delete(rfi, txn, &ri->dirents, &kd->key,
-					    dent_size(kd->dent.name_len),
-					    remove_entry_item_cb, kd);
-}
-
-/*
- * We use the remove pair fn to return ENOENT without trying to modify the entries while
- * preparing.
- */
-static int prepare_modify_entry(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
-				struct inode *dir, struct key_dent *kd)
-{
-	struct rpdfs_inode_info *ri = RPDFS_I(dir);
-
-	return rpdfs_btree_txn_prepare_modify(rfi, txn, &ri->dirents, &kd->key,
-					      remove_entry_item_cb, kd);
-}
-
-static int apply_modify_entry(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
-			      struct inode *dir, struct key_dent *kd)
-{
-	struct rpdfs_inode_info *ri = RPDFS_I(dir);
-
-	return rpdfs_btree_txn_apply_modify(rfi, txn, &ri->dirents, &kd->key,
-					    modify_entry_item_cb, kd);
-}
-
-static struct key_dent *alloc_key_dent(struct dentry *dentry, struct inode *inode)
-{
-	const char *name = dentry->d_name.name;
-	const unsigned name_len = dentry->d_name.len;
-	struct key_dent *kd;
-
-	kd = kmalloc(offsetof(struct key_dent, dent.name[name_len]), GFP_NOFS);
-	if (kd)
-		init_key_dent(kd, name, name_len, inode ? rpdfs_inode_ig(inode) : NULL, true);
-
-	return kd;
 }
 
 static void init_dir_size(struct inode *inode)
@@ -374,9 +216,8 @@ static int is_dir_empty(struct inode *inode)
 }
 
 /*
- * Helper function for readability. All consistency/corruption checks
- * should happen in the prepare phase, so there are no checks when
- * making changes.
+ * Helper function for readability.  The caller checked size before
+ * getting here consistency.
  */
 static void update_dir_size(struct inode *inode, s32 len)
 {
@@ -384,16 +225,8 @@ static void update_dir_size(struct inode *inode, s32 len)
 }
 
 /*
- * Allocate an inode in a block transaction and return an allocated vfs
- * inode at its ino/gen position.  Like _iget, this inserts an I_NEW
- * inode in the cache to reserve the ino/gen before the transaction.
- * This avoids having to insert the inode in the non-blocking apply
- * phase of the transaction, and avoids having to unwind the transaction
- * if insertion fails.
- *
- * It means we have to peek at what the allocation will be, and that can
- * change if the transaction retries and gets different allocations.
- * Like iget, we'll remove and unhash the ino/gen that wasn't used.
+ * Allocate a new inode, insert it into the vfs inode cache, and update
+ * its dirty block with the current inode.
  *
  * Is it a bit too cheeky that we're using iget_failed() to remove
  * inodes on errors?  It does all we want (unhash, mark bad, unlock_new,
@@ -404,44 +237,37 @@ static struct inode *create_new_inode(struct mnt_idmap *idmap, struct inode *dir
 {
 	struct super_block *sb = dir->i_sb;
 	struct rpdfs_fs_info *rfi = RPDFS_INODE_FS(dir);
-	struct rpdfs_ino_gen ig = {0,};
-	struct key_dent *kd = NULL;
+	struct rpdfs_transaction txn = RPDFS_INIT_TXN;
+	struct rpdfs_block_handle *inode_hnd = NULL;
+	struct rpdfs_block_handle *dir_hnd = NULL;
 	struct inode *inode = NULL;
-	DECLARE_RPDFS_TXN(txn);
-	u64 bnr;
+	struct rpdfs_ino_gen ig;
+	struct dent_cb_args da;
 	int ret;
 
-	if (dentry) {
-		kd = alloc_key_dent(dentry, NULL);
-		if (!kd) {
-			ret = -ENOMEM;
-			goto out;
-		}
-	}
-
-	do {
-		ret = rpdfs_txn_prepare_alloc(rfi, &txn, &bnr);
-		if (ret == 0) {
-			if (le64_to_cpu(ig.ino) != bnr) {
-				ig.ino = cpu_to_le64(bnr);
-				ig.gen = cpu_to_le64(1);
-				if (inode)
-					iget_failed(inode);
-				inode = rpdfs_new_inode(sb, &ig);
-				if (IS_ERR(inode)) {
-					ret = PTR_ERR(inode);
-					goto out;
-				}
-				rpdfs_txn_force_retry(&txn);
-				continue;
-			}
-			ret = rpdfs_inode_txn_prepare(rfi, &txn, dir, RBAF_WRITE);
-		}
-		if (ret == 0 && kd)
-			ret = prepare_add_entry(rfi, &txn, dir, kd);
-	} while (rpdfs_txn_retry(rfi, &txn, &ret));
+	ret = rpdfs_inode_acquire(rfi, dir, &dir_hnd, RBAF_WRITE) ?:
+	      rpdfs_txn_acquire_alloc(rfi, &txn, &inode_hnd);
 	if (ret < 0)
 		goto out;
+
+	ig.ino = cpu_to_le64(inode_hnd->bnr);
+	ig.gen = cpu_to_le64(1);
+	inode = rpdfs_new_inode(sb, &ig);
+	if (IS_ERR(inode)) {
+		/* -EBUSY from the ino being hashed probably should be retried, not returned */
+		ret = PTR_ERR(inode);
+		goto out;
+	}
+
+	if (dentry) {
+		init_dent_cb_args(&da, dentry, inode);
+
+		ret = insert_entry(rfi, &txn, dir, &da);
+		if (ret < 0)
+			goto out;
+
+		update_dir_size(dir, da.dent.name_len + 1);
+	}
 
 	/* update vfs inodes */
 	inode_init_owner(idmap, inode, dir, mode);
@@ -454,30 +280,25 @@ static struct inode *create_new_inode(struct mnt_idmap *idmap, struct inode *dir
 
 	rpdfs_inode_init_ops(inode);
 
-	/* update parent vfs inode and apply changes to referenced blocks */
 	if (S_ISDIR(mode))
 		inc_nlink(dir);
 
-	if (kd) {
-		update_dir_size(dir, kd->dent.name_len + 1);
-		kd->dent.ig = ig;
-		apply_add_entry(rfi, &txn, dir, kd);
-	}
-
-	/* sync changes to vfs inodes with inode blocks */
-	rpdfs_inode_txn_update(rfi, &txn, dir);
-	rpdfs_inode_txn_update(rfi, &txn, inode);
-
+	rpdfs_inode_update_dirty(rfi, &txn, inode, inode_hnd);
 	ret = 0;
 out:
-	rpdfs_txn_reset(rfi, &txn);
-	kfree(kd);
+	rpdfs_inode_update_dirty(rfi, &txn, dir, dir_hnd);
 
 	if (ret < 0) {
 		if (!IS_ERR_OR_NULL(inode))
 			iget_failed(inode);
 		inode = ERR_PTR(ret);
+		if (inode_hnd)
+			rpdfs_balloc_free_meta(rfi, &txn, inode_hnd->bnr);
 	}
+
+	rpdfs_block_release(rfi, &dir_hnd);
+	rpdfs_block_release(rfi, &inode_hnd);
+	rpdfs_txn_finish(rfi, &txn);
 
 	return inode;
 }
@@ -499,15 +320,24 @@ static int create_and_instantiate_new(struct mnt_idmap *idmap, struct inode *dir
 	return ret;
 }
 
+static int rpdfs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry,
+			umode_t mode, bool excl)
+{
+	return create_and_instantiate_new(idmap, dir, dentry, S_IFREG | mode);
+}
+
+static struct dentry *rpdfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+				  struct dentry *dentry, umode_t mode)
+{
+	return ERR_PTR(create_and_instantiate_new(idmap, dir, dentry, S_IFDIR | mode));
+}
+
 /*
  * The VFS did a bunch of checks before calling our unlink
  * implementation, but some other node could have made changes between
- * then and now. The prepare functions only succeed if the inodes have
- * not been freed or reused, the directory entry to be removed is still
- * there, and there is no detected corruption (which is distinct from
- * changes made by other nodes).
+ * then and now.
  */
-static int prepare_unlink(struct inode *dir, struct inode *inode, struct dentry *dentry)
+static int check_unlink(struct inode *dir, struct inode *inode, struct dentry *dentry)
 {
 	int ret;
 
@@ -541,44 +371,27 @@ out:
 	return ret;
 }
 
-static int rpdfs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry,
-			umode_t mode, bool excl)
-{
-	return create_and_instantiate_new(idmap, dir, dentry, S_IFREG | mode);
-}
-
-static struct dentry *rpdfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
-				  struct dentry *dentry, umode_t mode)
-{
-	return ERR_PTR(create_and_instantiate_new(idmap, dir, dentry, S_IFDIR | mode));
-}
-
 static int rpdfs_unlink(struct inode *dir, struct dentry *dentry)
 {
 	struct rpdfs_fs_info *rfi = RPDFS_INODE_FS(dir);
 	struct inode *inode = d_inode(dentry);
-	struct key_dent *kd = NULL;
-	DECLARE_RPDFS_TXN(txn);
+	struct rpdfs_block_handle *inode_hnd = NULL;
+	struct rpdfs_block_handle *dir_hnd = NULL;
+	struct rpdfs_transaction txn = RPDFS_INIT_TXN;
+	struct dent_cb_args da;
 	int ret;
 
-	kd = alloc_key_dent(dentry, inode);
-	if (!kd) {
-		ret = -ENOMEM;
-		goto out;
-	}
-
-	/* prepare all the blocks for the txn */
-	do {
-		ret = rpdfs_inode_txn_prepare(rfi, &txn, dir, RBAF_WRITE) ?:
-		      rpdfs_inode_txn_prepare(rfi, &txn, inode, RBAF_WRITE) ?:
-		      prepare_remove_entry(rfi, &txn, dir, kd) ?:
-		      prepare_unlink(dir, inode, dentry);
-	} while (rpdfs_txn_retry(rfi, &txn, &ret));
+	ret = rpdfs_inode_acquire_ordered(rfi, dir, &dir_hnd, inode, &inode_hnd,
+					  NULL, NULL, NULL, NULL, RBAF_WRITE);
 	if (ret < 0)
 		goto out;
 
-	/* apply changes to block structures */
-	apply_remove_entry(rfi, &txn, dir, kd);
+	init_dent_cb_args(&da, dentry, inode);
+
+	ret = check_unlink(dir, inode, dentry) ?:
+	      delete_entry(rfi, &txn, dir, &da);
+	if (ret < 0)
+		goto out;
 
 	/* update link count and metadata change time */
 	drop_nlink(inode);
@@ -592,14 +405,14 @@ static int rpdfs_unlink(struct inode *dir, struct dentry *dentry)
 	update_dir_size(dir, -(dentry->d_name.len + 1));
 	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
 
-	/* update block storage of vfs inodes */
-	rpdfs_inode_txn_update(rfi, &txn, dir);
-	rpdfs_inode_txn_update(rfi, &txn, inode);
-
+	rpdfs_inode_update_dirty(rfi, &txn, inode, inode_hnd);
 	ret = 0;
 out:
-	rpdfs_txn_reset(rfi, &txn);
-	kfree(kd);
+	rpdfs_inode_update_dirty(rfi, &txn, dir, dir_hnd);
+
+	rpdfs_block_release(rfi, &dir_hnd);
+	rpdfs_block_release(rfi, &inode_hnd);
+	rpdfs_txn_finish(rfi, &txn);
 
 	return ret;
 }
@@ -609,28 +422,22 @@ static int rpdfs_rmdir(struct inode *dir, struct dentry *dentry)
 	return rpdfs_unlink(dir, dentry);
 }
 
-/*
- * The vfs has verified the cached directories.  Our inode refresh will
- * fail if the inodes have been reused, so we don't have to test if
- * they're still directories.
- *
- * We update the vfs structures here, rather than down in the dirent
- * structure helpers, so that we can perform one modification for the
- * whole of the transaction.  For example, not modifying the target
- * inode's nlink while the callbacks might want to dec and inc it as
- * entries are removed and added.
- */
 static int rpdfs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry *old_dentry,
 			struct inode *new_dir, struct dentry *new_dentry, unsigned int flags)
 {
 	struct rpdfs_fs_info *rfi = RPDFS_INODE_FS(old_dir);
 	struct inode *old_inode = d_inode(old_dentry);
 	struct inode *new_inode = d_inode(new_dentry);
-	struct key_dent *old_kd = NULL;
-	struct key_dent *new_kd = NULL;
-	DECLARE_RPDFS_TXN(txn);
+	struct rpdfs_transaction txn = RPDFS_INIT_TXN;
+	struct rpdfs_block_handle *old_dir_hnd = NULL;
+	struct rpdfs_block_handle *new_dir_hnd = NULL;
+	struct rpdfs_block_handle *old_inode_hnd = NULL;
+	struct rpdfs_block_handle *new_inode_hnd = NULL;
+	struct dent_cb_args old_da;
+	struct dent_cb_args new_da;
 	struct timespec64 now;
 	int ret;
+	int err;
 
 	if (flags & ~RENAME_NOREPLACE) {
 		ret = -EINVAL;
@@ -643,43 +450,35 @@ static int rpdfs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct d
 		goto out;
 	}
 
-	old_kd = alloc_key_dent(old_dentry, old_inode);
-	new_kd = alloc_key_dent(new_dentry, new_inode);
-	if (!old_kd || !new_kd) {
-		ret = -ENOMEM;
-		goto out;
-	}
-
-	/* prepare all the blocks for the txn */
-	do {
-		ret = rpdfs_inode_txn_prepare(rfi, &txn, old_dir, RBAF_WRITE) ?:
-		      rpdfs_inode_txn_prepare(rfi, &txn, old_inode, RBAF_WRITE) ?:
-		      prepare_remove_entry(rfi, &txn, old_dir, old_kd);
-		if (ret == 0 && new_dir != old_dir)
-			ret = rpdfs_inode_txn_prepare(rfi, &txn, new_dir, RBAF_WRITE);
-		if (ret == 0) {
-			if (new_inode) {
-				ret = rpdfs_inode_txn_prepare(rfi, &txn, new_inode, RBAF_WRITE) ?:
-				      prepare_modify_entry(rfi, &txn, new_dir, new_kd);
-			} else {
-				ret = prepare_add_entry(rfi, &txn, new_dir, new_kd);
-			}
-		}
-	} while (rpdfs_txn_retry(rfi, &txn, &ret));
+	ret = rpdfs_inode_acquire_ordered(rfi, old_dir, &old_dir_hnd,
+					  (new_dir != old_dir) ? new_dir : NULL, &new_dir_hnd,
+					  old_inode, &old_inode_hnd,
+					  new_inode, &new_inode_hnd, RBAF_WRITE);
 	if (ret < 0)
 		goto out;
 
-	/*
-	 * TODO: walk ancestors, and if there is a directory to be
-	 * deleted, check if it is empty.
-	 */
+	init_dent_cb_args(&old_da, old_dentry, old_inode);
+	init_dent_cb_args(&new_da, new_dentry, new_inode);
 
-	/* apply changes to block structures */
-	apply_remove_entry(rfi, &txn, old_dir, old_kd);
 	if (new_inode)
-		apply_modify_entry(rfi, &txn, new_dir, new_kd);
+		ret = modify_entry(rfi, &txn, new_dir, &new_da);
 	else
-		apply_add_entry(rfi, &txn, new_dir, new_kd);
+		ret = insert_entry(rfi, &txn, new_dir, &new_da);
+	if (ret < 0)
+		goto out;
+
+	ret = delete_entry(rfi, &txn, old_dir, &old_da);
+	if (ret < 0) {
+		if (new_inode) {
+			/* clobber new_da to modify new name to point to old inode */
+			init_dent_cb_args(&new_da, new_dentry, old_inode);
+			err = modify_entry(rfi, &txn, new_dir, &new_da);
+		} else {
+			err = delete_entry(rfi, &txn, new_dir, &new_da);
+		}
+		BUG_ON(err); /* unwind can't get errors */
+		goto out;
+	}
 
 	/* update dir sizes */
 	update_dir_size(old_dir, -(old_dentry->d_name.len + 1));
@@ -711,30 +510,56 @@ static int rpdfs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct d
 	if (new_inode)
 		inode_set_ctime_to_ts(new_inode, now);
 
-	/* update block storage of vfs inodes */
-	rpdfs_inode_txn_update(rfi, &txn, old_dir);
-	rpdfs_inode_txn_update(rfi, &txn, old_inode);
-	if (new_dir != old_dir)
-		rpdfs_inode_txn_update(rfi, &txn, new_dir);
+	rpdfs_inode_update_dirty(rfi, &txn, old_inode, old_inode_hnd);
 	if (new_inode)
-		rpdfs_inode_txn_update(rfi, &txn, new_inode);
-
+		rpdfs_inode_update_dirty(rfi, &txn, new_inode, new_inode_hnd);
 	ret = 0;
 out:
-	rpdfs_txn_reset(rfi, &txn);
-	kfree(old_kd);
-	kfree(new_kd);
+	rpdfs_inode_update_dirty(rfi, &txn, old_dir, old_dir_hnd);
+	if (new_dir != old_dir)
+		rpdfs_inode_update_dirty(rfi, &txn, new_dir, new_dir_hnd);
+
+	rpdfs_block_release(rfi, &old_dir_hnd);
+	rpdfs_block_release(rfi, &new_dir_hnd);
+	rpdfs_block_release(rfi, &old_inode_hnd);
+	rpdfs_block_release(rfi, &old_inode_hnd);
+
+	rpdfs_txn_finish(rfi, &txn);
 
 	return ret;
 }
 
-static int prepare_copy_entries(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
-				struct inode *inode, struct rpdfs_btree_key *key,
-				void *buf, size_t size)
+static size_t aligned_dent_size(size_t name_len)
 {
-	struct rpdfs_inode_info *ri = RPDFS_I(inode);
+	return ALIGN(offsetof(struct rpdfs_dirent, name[name_len]),
+		     __alignof__(struct rpdfs_dirent));
+}
 
-	return rpdfs_btree_txn_prepare_copy_items(rfi, txn, &ri->dirents, key, buf, size);
+/*
+ * We're using the copied dent's gen to store the key so that we don't
+ * have to create some wrapper type to store the dent and key.
+ */
+static int copy_item_cb(struct rpdfs_fs_info *rfi, u64 key, void *val, u16 val_size, void *arg)
+{
+	struct kvec *kv = arg;
+	struct rpdfs_dirent *dent = val;
+	struct rpdfs_dirent *copied;
+	size_t size;
+
+	if (bad_dent_item(dent, val_size))
+		return -EUCLEAN;
+
+	size = aligned_dent_size(dent->name_len);
+	if (size > kv->iov_len)
+		return 0;
+
+	copied = kv->iov_base;
+	memcpy(copied, dent, offsetof(struct rpdfs_dirent, name[dent->name_len]));
+	copied->ig.gen = cpu_to_le64(key);
+
+	kv->iov_base += size;
+	kv->iov_len -= size;
+	return -ELOOP;
 }
 
 /*
@@ -746,58 +571,64 @@ static int rpdfs_readdir(struct file *file, struct dir_context *ctx)
 {
 	struct inode *inode = file_inode(file);
 	struct rpdfs_fs_info *rfi = RPDFS_INODE_FS(inode);
-	struct rpdfs_btree_item_args *bti;
-	struct rpdfs_btree_key key;
+	struct rpdfs_inode_info *ri = RPDFS_I(inode);
+	const size_t buf_size = RPDFS_BLOCK_SIZE;
+	struct rpdfs_block_handle *hnd = NULL;
 	struct rpdfs_dirent *dent;
-	struct page *page = NULL;
-	DECLARE_RPDFS_TXN(txn);
+	void *buf = NULL;
+	struct kvec kv;
 	int ret;
-	int i;
 
 	if (!dir_emit_dots(file, ctx)) {
 		ret = 0;
 		goto out;
 	}
 
-	page = alloc_page(GFP_NOFS);
-	if (!page) {
+	buf = kvmalloc(buf_size, GFP_KERNEL);
+	if (!buf) {
 		ret = -ENOMEM;
 		goto out;
 	}
 
+	ret = rpdfs_inode_acquire(rfi, inode, &hnd, 0);
+	if (ret < 0)
+		goto out;
+
 	for (;;) {
-		init_dent_key(&key, ctx->pos);
-		do {
-			ret = rpdfs_inode_txn_prepare(rfi, &txn, inode, 0) ?:
-			      prepare_copy_entries(rfi, &txn, inode, &key, page_address(page),
-						   PAGE_SIZE);
-		} while (rpdfs_txn_retry(rfi, &txn, &ret));
-		if (ret <= 0)
+		/* done if input or iteration passes valid keys */
+		if (ctx->pos > RPDFS_BTREE_ITEM_KEY_MASK) {
+			ret = 0;
+			goto out;
+		}
+
+		kv.iov_base = buf;
+		kv.iov_len = buf_size;
+		ret = rpdfs_btree_read_items(rfi, &ri->dirents, ctx->pos, copy_item_cb, &kv);
+		if (ret < 0)
 			goto out;
 
-		for (i = 0, bti = page_address(page); i < ret;
-		     i++, bti = rpdfs_btree_next_copied_item(bti)) {
-			dent = bti->val;
+		/* done when there's no more entries */
+		if (kv.iov_base == buf)
+			break;
 
-			ctx->pos = dent_key_hash(&bti->key);
+		dent = buf;
+		while ((void *)dent < kv.iov_base) {
+			ctx->pos = le64_to_cpu(dent->ig.gen);
 			if (!dir_emit(ctx, dent->name, dent->name_len, le64_to_cpu(dent->ig.ino),
-				      DT_UNKNOWN) || ctx->pos == U64_MAX) {
+				      DT_UNKNOWN) || ctx->pos == S64_MAX) {
 				ret = 0;
 				goto out;
 			}
 
-			/* XXX worry more about eof, wrapping, and full precision hash */
 			ctx->pos++;
+			dent = (void *)dent + aligned_dent_size(dent->name_len);
 		}
-
-		rpdfs_txn_reset(rfi, &txn);
 	}
 
 	ret = 0;
 out:
-	rpdfs_txn_reset(rfi, &txn);
-	if (page)
-		__free_page(page);
+	rpdfs_block_release(rfi, &hnd);
+	kfree(buf);
 	return ret;
 }
 
