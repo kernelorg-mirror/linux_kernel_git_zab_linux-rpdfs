@@ -11,4 +11,9 @@
 	a_ < b_ ? -1 : a_ > b_ ? 1 : 0;		\
 })
 
+static inline bool rpdfs_names_match(const char *a, unsigned a_len, const char *b, unsigned b_len)
+{
+	return a_len == b_len && memcmp(a, b, a_len) == 0;
+}
+
 #endif
