@@ -223,11 +223,6 @@ struct rpdfs_dirent {
  */
 #define RPDFS_EMPTY_DIR_LEN	5
 
-/*
- * xattrs are currently implemented as btree items, whose keys are the
- * hash of the name combined with the xattr_create_counter value in the
- * inode, which makes the keys unique - no collisions.
- */
 struct rpdfs_xattr {
 	__le16 val_len;
 	__u8 name_len;
@@ -237,17 +232,11 @@ struct rpdfs_xattr {
 	};
 };
 
+/* size of the xattr struct stored in the item before the name */
+#define RPDFS_XATTR_SIZEOF offsetof(struct rpdfs_xattr, name)
+
 /* max xattr name length, without null term */
 #define	RPDFS_XATTR_MAX_NAME_LEN	RPDFS_NAME_MAX
-
-/*
- * Maximum size of the xattr struct plus non-null-terminated xattr
- * name/value (see xattr_size()).
- *
- * TODO: support much larger xattrs by storing in blocks instead of
- * btree items.
- */
-#define RPDFS_XATTR_MAX_SIZE	RPDFS_BTREE_MAX_VAL_SIZE
 
 /*
  * Maximum length of all null terminated xattr names per inode. This is
