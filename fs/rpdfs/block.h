@@ -85,10 +85,7 @@ int rpdfs_block_acquire(struct rpdfs_fs_info *rfi, u64 bnr, struct rpdfs_block_h
 			rbaf_t rbaf);
 void rpdfs_block_release(struct rpdfs_fs_info *rfi, struct rpdfs_block_handle **hnd);
 
-typedef struct rpdfs_block_handle *(*rpdfs_block_entry_handle_fn_t)(struct list_head *pos);
-
-void rpdfs_block_make_dirty(struct rpdfs_fs_info *rfi, struct list_head *list,
-			    rpdfs_block_entry_handle_fn_t entry_handle_fn);
+void rpdfs_block_dirty(struct rpdfs_fs_info *rfi, u64 other_bnr, struct rpdfs_block_handle *hnd);
 int rpdfs_block_flush(struct rpdfs_fs_info *rfi, u64 bnr, bool wait);
 int rpdfs_block_sync(struct rpdfs_fs_info *rfi, bool wait);
 
