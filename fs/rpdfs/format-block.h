@@ -24,16 +24,6 @@ struct rpdfs_btree_root {
 	__u8 height;
 };
 
-/*
- * Keys are relatively large to allow precise deletion of index keys.
- * They contain the rule's output as well as its inode and rule number.
- * Keys are effectively little-endian 128bit values, but they're only
- * aligned to 64bit in the block.
- */
-struct rpdfs_btree_key {
-	__le64 lsq;
-	__le64 msq;
-};
 
 /*
  * The first and last keys record the range of item keys that can be
@@ -42,43 +32,70 @@ struct rpdfs_btree_key {
  * the range a bit easier to use and to update as we merge and split.
  */
 struct rpdfs_btree_block {
-	struct rpdfs_btree_key first;
-	struct rpdfs_btree_key last;
-	__le64 bnr;
 	__le16 nr_items;
-	__le16 tail_free;
+	__le16 avail_free;
 	__le16 total_free;
+	__u8 _pad;
 	__u8 level;
-	__u8 _pad[1];
-	struct rpdfs_btree_item_header {
-		__le16 off;
-		__le16 val_size;
-	} ihdrs[];
+	__le64 items[];
 };
 
 /*
- * The item's value payload is 64bit aligned and immediately follows the
- * item struct in the block.
+ * Low bits of the key are used to resolve hash collisions so that an
+ * unlucky birthday paradox winner doesn't see errors.
+ *
+ * We ensure that all the collisions for a key are kept in the same
+ * leaf.  This means that we can have to move all the collisions
+ * together as we split or merge.  Today the max item size is a
+ * worryingly large portion of the block.  We have to keep the number of
+ * collision bits very low to avoid the space taken up by collisions
+ * exceeding half a block and throwing a bunch of balancing assumptions
+ * out the window.
  */
-struct rpdfs_btree_item {
-	struct rpdfs_btree_key key;
-	__u8 val[];
-};
+#define RPDFS_BTREE_KEY_COLL_BITS	1
+#define RPDFS_BTREE_KEY_COLL_MASK	((1ULL << RPDFS_BTREE_KEY_COLL_BITS) - 1)
+
+#define RPDFS_BTREE_VAL_ALIGN_SHIFT	3
+#define RPDFS_BTREE_VAL_ALIGN		(1 << RPDFS_BTREE_VAL_ALIGN_SHIFT)
 
 /*
- * We want to avoid there only being a few items in a full block so we
- * chose a reasonably small fraction of the block size.  The array of
- * item headers is sized to fit the max number of items with no value
- * payload, while aligning the first item after the array.
+ * The smaller the max item size, the closer we can come to balancing
+ * blocks by used size rather than item count.  This is made a bit worse
+ * by keeping all key collisions in the same leaf block.  The max we can
+ * be out of balance isn't one item but the number of collisions.  So we
+ * push the max size down as far as is reasonable.  The specific max is
+ * roughly the size of an xattr with a full compliment of block
+ * references.
  */
-#define RPDFS_BTREE_MAX_VAL_SIZE	511
-#define RPDFS_BTREE_ITEM_ALIGN		8
-#define RPDFS_BTREE_MAX_ITEMS									\
-	ALIGN_DOWN(((RPDFS_BLOCK_SIZE - sizeof(struct rpdfs_btree_block)) /			\
-		   (sizeof(struct rpdfs_btree_key) + sizeof(struct rpdfs_btree_item_header))),	\
-		   RPDFS_BTREE_ITEM_ALIGN)
-#define RPDFS_BTREE_MAX_FREE									\
-	(RPDFS_BLOCK_SIZE - offsetof(struct rpdfs_btree_block, ihdrs[RPDFS_BTREE_MAX_ITEMS]))
+#define RPDFS_BTREE_MAX_VAL_SIZE	(8 + 255 + (8 * 16))
+
+/*
+ * We pack the fields of each item into a word.  Each shift here is to
+ * go from the native form into the packed bit position.  The masks are
+ * in terms of the native value.
+ *
+ * The value off is a bit special because it is aligned and the low bits
+ * are always clear.  The shift is to go between the full precision byte
+ * offset and the packed offset as a factor of the alignment.  It has
+ * masks for both the native and packed form.
+ *
+ * The key is packed into the most significant bits so that we can shift
+ * a search key to match and perform efficient binary searches of words.
+ */
+#define RPDFS_BTREE_ITEM_OFF_BITS	(RPDFS_BLOCK_SHIFT - RPDFS_BTREE_VAL_ALIGN_SHIFT)
+#define RPDFS_BTREE_ITEM_SIZE_BITS	order_base_2(RPDFS_BTREE_MAX_VAL_SIZE + 1)
+#define RPDFS_BTREE_ITEM_KEY_BITS	(64 - (RPDFS_BTREE_ITEM_OFF_BITS + \
+					       RPDFS_BTREE_ITEM_SIZE_BITS))
+
+#define RPDFS_BTREE_ITEM_OFF_SHIFT	RPDFS_BTREE_VAL_ALIGN_SHIFT
+#define RPDFS_BTREE_ITEM_OFF_MASK	((1ULL << (RPDFS_BTREE_ITEM_OFF_BITS + \
+						   RPDFS_BTREE_VAL_ALIGN_SHIFT)) - 1)
+#define RPDFS_BTREE_ITEM_OFF_PACK_MASK	((1ULL << RPDFS_BTREE_ITEM_OFF_BITS) - 1)
+#define RPDFS_BTREE_ITEM_SIZE_SHIFT	RPDFS_BTREE_ITEM_OFF_BITS
+#define RPDFS_BTREE_ITEM_SIZE_MASK	((1ULL << RPDFS_BTREE_ITEM_SIZE_BITS) - 1)
+#define RPDFS_BTREE_ITEM_KEY_SHIFT	(RPDFS_BTREE_ITEM_SIZE_SHIFT + \
+					 RPDFS_BTREE_ITEM_SIZE_BITS)
+#define RPDFS_BTREE_ITEM_KEY_MASK	((1ULL << RPDFS_BTREE_ITEM_KEY_BITS) - 1)
 
 /*
  * The inode generation number changes every time a specific inode is

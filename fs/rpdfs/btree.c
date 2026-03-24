@@ -14,48 +14,37 @@
 #include "string.h"
 
 /*
- * These block btrees are used to sort items with variable size value
- * payloads and unpredictable key distribution.  In the file system,
- * that means dirents, xattrs, and global indices.
+ * These block btrees are used to index relatively small variable size
+ * items with keys that are hashes of larger unique identifiers.
+ * Classically, dirents and xattrs by their name.
+ *
+ * The interface specifically supports hash collisions.  Low bits of the
+ * stored keys are used to track a limited number of collisions without
+ * returning errors.  In the calling API keys lead to leaf blocks and
+ * callbacks are used to let the callers perform their search of deeper
+ * item identity amongst collisions.
  *
  * We're leaning hard into minimalism for as long as we can get away
- * with it.  Items keys and values are stored at increasing offsets in
- * the block as they're inserted.  An array of small item headers at the
- * start of the block stores the offset of the item and are kept in key
- * sorted order.  We're spending the cost of cpu cycles on memmove to
- * maintain sorting while getting the benefit of simpler structures.
+ * with it.  Variable length values are allocated from free space at the
+ * end of the block.  An array of words at the start of the block stores
+ * the minimal fixed size item fields and are kept in key sorted order.
  *
- * We don't track free internal space in the blocks.  An allocation
- * offset advances towards the tail as we allocate.  We can compact
- * items in a block to free internal space before splitting a block to
- * satisfy insertion.
+ * We don't index free internal space in the blocks.  A value allocation
+ * offset moves from the end of the block towards the front.  We can
+ * compact values to reclaim fragmented free space created by deletions.
  */
 
 /*
- * If a block's total_free reaches this value then we try to move items
- * from a sibling to fill it above the threshold.  If the sibling is
- * also at the threshold then the two blocks are merged.
+ * Once a block's total_free is at or above this value we try to merge
+ * items from siblings.  If a block and its sibling are both at the
+ * value then they can be merged into one block.
  *
- * We want to leave some slack between the max size of a merged block
- * (80% full) and a full block so that the repeated insertion and
- * deletion of a few items doesn't bounce a pair of blocks between
- * splitting and merging.
+ * We round up half the max possible free space to the value alignment.
+ * As free space increases used space decreases, so free greater than
+ * half must have used less than half so they can combine.
  */
-#define RPDFS_BTREE_MERGE_FREE_THRESH	(RPDFS_BTREE_MAX_FREE * (100 - 40) / 100)
-
-/*
- * If an insertion could be performed after compacting free space, but
- * total free space is less than this threshold, then we'll split the
- * block instead.  This avoids excessive compaction if insert/delete
- * cycles constantly delete to create fragmented space and then try to
- * insert into it.  The higher we set this value the more items need to
- * be involved in the cycle before each compaction, so the lower its
- * amortized cost.
- */
-#define RPDFS_BTREE_SPLIT_FREE_THRESH	(RPDFS_BTREE_MAX_FREE * 10 / 100)
-
-static struct rpdfs_btree_key min_key = { 0, 0 };
-static struct rpdfs_btree_key max_key = { cpu_to_le64(U64_MAX), cpu_to_le64(U64_MAX) };
+#define RPDFS_BTREE_MERGE_FREE_THRESH \
+	round_up((RPDFS_BLOCK_SIZE - sizeof(struct rpdfs_btree_block)) / 2, RPDFS_BTREE_VAL_ALIGN)
 
 /* Initialize an empty btree root */
 void rpdfs_btree_root_init(struct rpdfs_btree_root *root)
@@ -70,16 +59,13 @@ void rpdfs_btree_root_init(struct rpdfs_btree_root *root)
  * want to write old kernel memory as block contents so we explicitly
  * zero the block before initializing.
  */
-static void init_block(struct rpdfs_btree_block *bt, u8 level,
-		       struct rpdfs_btree_key *first, struct rpdfs_btree_key *last)
+static void init_block(struct rpdfs_btree_block *bt, u8 level)
 {
 	memzero_explicit(bt, RPDFS_BLOCK_SIZE);
 
-	bt->first = *first;
-	bt->last = *last;
 	bt->nr_items = 0;
-	bt->tail_free = cpu_to_le16(RPDFS_BTREE_MAX_FREE);
-	bt->total_free = bt->tail_free;
+	bt->avail_free = cpu_to_le16(RPDFS_BLOCK_SIZE - sizeof(struct rpdfs_btree_block));
+	bt->total_free = bt->avail_free;
 	bt->level = level;
 }
 
@@ -92,346 +78,347 @@ static void init_block(struct rpdfs_btree_block *bt, u8 level,
 void rpdfs_btree_init_first_block(struct rpdfs_btree_root *root, struct rpdfs_block_ref *ref,
 				  struct rpdfs_btree_block *bt)
 {
-	init_block(bt, 0, &min_key, &max_key);
+	init_block(bt, 0);
 	root->ref = *ref;
 	root->height = 1;
 }
 
-static void bug_on_bad_item_off(size_t off)
+static inline u64 key_coll(u64 key)
 {
-	BUG_ON(off < offsetof(struct rpdfs_btree_block, ihdrs[RPDFS_BTREE_MAX_ITEMS]));
-	BUG_ON(off > (RPDFS_BLOCK_SIZE - sizeof(struct rpdfs_btree_item)));
-	BUG_ON(!IS_ALIGNED(off, RPDFS_BTREE_ITEM_ALIGN));
+	return key & RPDFS_BTREE_KEY_COLL_MASK;
 }
 
-static struct rpdfs_btree_item *item_from_off(const struct rpdfs_btree_block *bt, u16 off)
+static inline u64 key_no_coll(u64 key)
 {
-	if (off == 0)
-		return NULL;
+	return key & ~RPDFS_BTREE_KEY_COLL_MASK;
+}
 
-	bug_on_bad_item_off(off);
+static u16 item_off(struct rpdfs_btree_block *bt, u16 ind)
+{
+	return (le64_to_cpu(bt->items[ind]) << RPDFS_BTREE_ITEM_OFF_SHIFT) &
+		RPDFS_BTREE_ITEM_OFF_MASK;
+}
+
+static void set_item_off(struct rpdfs_btree_block *bt, u16 ind, u16 off)
+{
+	bt->items[ind] = (bt->items[ind] & cpu_to_le64(~RPDFS_BTREE_ITEM_OFF_PACK_MASK)) |
+			 cpu_to_le64(off >> RPDFS_BTREE_ITEM_OFF_SHIFT);
+}
+
+static u16 item_size(struct rpdfs_btree_block *bt, u16 ind)
+{
+	return (le64_to_cpu(bt->items[ind]) >> RPDFS_BTREE_ITEM_SIZE_SHIFT) &
+		RPDFS_BTREE_ITEM_SIZE_MASK;
+}
+
+static u64 item_key(struct rpdfs_btree_block *bt, u16 ind)
+{
+	return le64_to_cpu(bt->items[ind]) >> RPDFS_BTREE_ITEM_KEY_SHIFT;
+}
+
+static void set_item_key(struct rpdfs_btree_block *bt, u16 ind, u64 key)
+{
+	bt->items[ind] = (bt->items[ind] &
+			  cpu_to_le64(~(RPDFS_BTREE_ITEM_KEY_MASK << RPDFS_BTREE_ITEM_KEY_SHIFT))) |
+			 cpu_to_le64(key << RPDFS_BTREE_ITEM_KEY_SHIFT);
+}
+
+static __le64 pack_item(u64 key, u16 off, u16 size)
+{
+	WARN_ON_ONCE(off & ~RPDFS_BTREE_ITEM_OFF_MASK);
+	WARN_ON_ONCE(size & ~RPDFS_BTREE_ITEM_SIZE_MASK);
+
+	return cpu_to_le64((key << RPDFS_BTREE_ITEM_KEY_SHIFT) |
+			   ((size & RPDFS_BTREE_ITEM_SIZE_MASK) << RPDFS_BTREE_ITEM_SIZE_SHIFT) |
+			   ((off & RPDFS_BTREE_ITEM_OFF_MASK) >> RPDFS_BTREE_ITEM_OFF_SHIFT));
+}
+
+static void *item_val(struct rpdfs_btree_block *bt, u16 ind)
+{
+	u16 off = item_off(bt, ind);
+
+	BUG_ON(off < offsetof(struct rpdfs_btree_block, items[le16_to_cpu(bt->nr_items)]));
+	BUG_ON(off > (RPDFS_BLOCK_SIZE - RPDFS_BTREE_VAL_ALIGN));
+	BUG_ON(!IS_ALIGNED(off, RPDFS_BTREE_VAL_ALIGN));
 
 	return (void *)bt + off;
 }
 
-static inline struct rpdfs_btree_item *item_from_ind(struct rpdfs_btree_block *bt, u16 ind)
+static u16 aligned_val_size(u16 val_size)
 {
-	BUG_ON(ind >= le16_to_cpu(bt->nr_items));
-
-	return item_from_off(bt, le16_to_cpu(bt->ihdrs[ind].off));
+	return ALIGN(val_size, RPDFS_BTREE_VAL_ALIGN);
 }
 
-static u16 item_val_size(struct rpdfs_btree_block *bt, u16 ind)
+static u16 full_item_size(u16 val_size)
 {
-	return le16_to_cpu(bt->ihdrs[ind].val_size);
+	return sizeof_field(struct rpdfs_btree_block, items[0]) + aligned_val_size(val_size);
 }
 
-static u16 aligned_item_size(u16 val_size)
+static u16 last_ind(struct rpdfs_btree_block *bt)
 {
-	return ALIGN(sizeof(struct rpdfs_btree_item) + val_size, RPDFS_BTREE_ITEM_ALIGN);
+	if (WARN_ON_ONCE(bt->nr_items == 0))
+		return 0;
+	else
+		return le16_to_cpu(bt->nr_items) - 1;
 }
 
-static struct rpdfs_btree_item *first_item(struct rpdfs_btree_block *bt)
+u64 rpdfs_btree_last_key(struct rpdfs_btree_block *bt)
 {
-	return item_from_ind(bt, 0);
-}
-
-static struct rpdfs_btree_item *last_item(struct rpdfs_btree_block *bt)
-{
-	/* bad ind from nr_items == 0 caught by item_from_ind assertion */
-	return item_from_ind(bt, le16_to_cpu(bt->nr_items) - 1);
-}
-
-/*
- * Initialize a bti to point to an item in the block.  As a slight
- * convenience/hack, if the caller describes an item that doesn't exist
- * then we set the key to all ones which will stop it from being used.
- */
-static void init_bti(struct rpdfs_btree_item_args *bti, struct rpdfs_btree_block *bt, u16 ind)
-{
-	struct rpdfs_btree_item *item;
-
-	if (ind >= le16_to_cpu(bt->nr_items)) {
-		rpdfs_btree_key_set_max(&bti->key);
-		bti->val = NULL;
-		bti->val_size = 0;
-	} else {
-		item = item_from_ind(bt, ind);
-		bti->key = item->key;
-		bti->val = &item->val[0];
-		bti->val_size = item_val_size(bt, ind);
-	}
+	if (bt->nr_items != 0)
+		return item_key(bt, last_ind(bt));
+	else
+		return 0;
 }
 
 /*
- * Find the first index in the items array that the search key is less than.  Can return
- * the index past the current size of the array for insertion.  The caller is responsible
- * for using the returned index appropriately.
+ * Find the first index in the item array whose key is greater than or
+ * equal to the search key.  Callers can use the full precision key or
+ * can mask off the collision bits depending on what they're looking
+ * for.
  */
-static u16 find_key_ind(struct rpdfs_btree_block *bt, struct rpdfs_btree_key *key)
+static u16 find_key_ind(struct rpdfs_btree_block *bt, u64 key)
 {
-	struct rpdfs_btree_item *item;
 	int start = 0;
 	int end = (int)le16_to_cpu(bt->nr_items) - 1;
 	int ind = 0;
-	int cmp;
+
+	/* shift the key into the packed item position */
+	key <<= RPDFS_BTREE_ITEM_KEY_SHIFT;
 
 	while (start <= end) {
 		ind = (start + end) >> 1;
-		item = item_from_ind(bt, ind);
 
-		cmp = rpdfs_btree_key_cmp(key, &item->key);
-		if (cmp == 0)
-			return ind;
-		else if (cmp < 0)
-			end = ind - 1;
-		else
+		if (key > le64_to_cpu(bt->items[ind]))
 			start = ++ind;
+		else
+			end = ind - 1;
 	}
 
 	return ind;
 }
 
-static int cmp_ihdr_off(const void *A, const void *B, const void *priv)
+static int cmp_item_off(const void *A, const void *B)
 {
-	const struct rpdfs_btree_block *bt = priv;
-	const struct rpdfs_btree_item_header *a = &bt->ihdrs[*(u16 *)A];
-	const struct rpdfs_btree_item_header *b = &bt->ihdrs[*(u16 *)B];
+	const __le64 *item_a = A;
+	const __le64 *item_b = B;
 
-	return (int)le16_to_cpu(a->off) - (int)le16_to_cpu(b->off);
+	return rpdfs_compare(le64_to_cpu(*item_a) & RPDFS_BTREE_ITEM_OFF_PACK_MASK,
+			     le64_to_cpu(*item_b) & RPDFS_BTREE_ITEM_OFF_PACK_MASK);
 }
 
-static int cmp_ihdr_key(const void *A, const void *B, const void *priv)
+static int cmp_item_key(const void *A, const void *B)
 {
-	const struct rpdfs_btree_block *bt = priv;
-	const struct rpdfs_btree_item_header *a = A;
-	const struct rpdfs_btree_item_header *b = B;
-	const struct rpdfs_btree_item *item_a = item_from_off(bt, le16_to_cpu(a->off));
-	const struct rpdfs_btree_item *item_b = item_from_off(bt, le16_to_cpu(b->off));
+	const __le64 *item_a = A;
+	const __le64 *item_b = B;
 
-	return rpdfs_btree_key_cmp(&item_a->key, &item_b->key);
+	return rpdfs_compare(le64_to_cpu(*item_a), le64_to_cpu(*item_b));
 }
 
 /*
- * True if there's room in the block for an insertion but not at the
- * tail of the block.  Compaction shuffles the location of items in the
- * block so operations on a block are generally making this decision
- * before they get references to items in the block.
+ * Return the offset of a value of the given size at the end of the
+ * currently available free space at the center of the block.
  */
-static bool should_compact(struct rpdfs_btree_block *bt, u16 val_size)
+static u16 free_val_off(struct rpdfs_btree_block *bt, u16 val_size)
 {
-	u16 val_bytes = aligned_item_size(val_size);
+	return offsetof(struct rpdfs_btree_block, items[le16_to_cpu(bt->nr_items)]) +
+		le16_to_cpu(bt->avail_free) - aligned_val_size(val_size);
+}
 
-	return (val_bytes > le16_to_cpu(bt->tail_free)) &&
-	       (val_bytes <= le16_to_cpu(bt->total_free));
+static bool item_fits(__le16 free, u16 val_size)
+{
+	return full_item_size(val_size) <= le16_to_cpu(free);
 }
 
 /*
- * True if the caller should split the block before trying to insert an
- * item with the given val size.
- *
- * We split if the item doesn't fit in free space at all.
- *
- * But we'll also split if the item doesn't fit in tail free space and
- * would fit in fragmented free space, but free space is so low that
- * we're likely to split anyway soon after compaction.
+ * True if the caller must split the block before trying to insert an
+ * item that wouldn't fit in the total free space in the block after
+ * compaction.
  */
-bool rpdfs_btree_should_split(struct rpdfs_btree_block *bt, u16 val_size)
+bool rpdfs_btree_must_split(struct rpdfs_btree_block *bt, u16 val_size)
 {
-	u16 size = aligned_item_size(val_size);
-	u16 total_free = le16_to_cpu(bt->total_free);
-
-	return (size > total_free) ||
-	       (size > le16_to_cpu(bt->tail_free) && total_free < RPDFS_BTREE_SPLIT_FREE_THRESH);
+	return !item_fits(bt->total_free, val_size);
 }
 
 /*
- * True if the caller should merge or rebalance this block after
- * removing an item with the given value size. If the free space gets
- * large enough that the item population goes below the merge free space
- * threshold, then we want to pull items from or merge with a sibling
- * block to restore balance.
+ * True if the block has enough free space that it's fallen under the
+ * min item population and we should try and merge it with a sibling.
  */
-bool rpdfs_btree_should_merge(struct rpdfs_btree_block *bt, u16 val_size)
+bool rpdfs_btree_should_merge(struct rpdfs_btree_block *bt)
 {
-	return (le16_to_cpu(bt->total_free) + aligned_item_size(val_size)) >=
-		RPDFS_BTREE_MERGE_FREE_THRESH;
+	return le16_to_cpu(bt->total_free) >= RPDFS_BTREE_MERGE_FREE_THRESH;
 }
 
 /*
- * Move the region of item headers from the index to the end of the
+ * Move the region of the item array from the index to the end of the
  * array in the given direction.  The index may fall outside the array
- * (when inserting into an empty block or deleting the last sorted item
- * in the block).
+ * when inserting into an empty block or deleting the last sorted item
+ * in the block.
  */
-static inline void memmove_item_headers(struct rpdfs_btree_block *bt, u16 ind, int dist)
+static inline void memmove_items(struct rpdfs_btree_block *bt, u16 ind, int dist)
 {
 	u16 nr = le16_to_cpu(bt->nr_items);
 
 	if (ind < nr)
-		memmove(&bt->ihdrs[ind + dist], &bt->ihdrs[ind], (nr - ind) * sizeof(bt->ihdrs[0]));
+		memmove(&bt->items[ind + dist], &bt->items[ind],
+			(nr - ind) * sizeof(bt->items[0]));
 }
 
 /*
- * Consume free space at the end of the block to create a new item,
- * initialize it with the caller's arguments, and link it into the tree
- * at the parent's link.
+ * Defragment internal free space by moving all the values towards the
+ * end of the block, gathering all free space in the center of the
+ * block.  We sort the items by offset so we can move the items by
+ * iterating in offset order.  Then we return the item headers to being
+ * sorted by key.
  *
- * Because this references an existing item we will not compact items
- * here. The caller must ensure that there is sufficient free space for
- * the item.
- */
-static struct rpdfs_btree_item *insert_item(struct rpdfs_btree_block *bt, u16 ind,
-					    struct rpdfs_btree_key *key, void *val, u16 val_size)
-{
-	u16 off = RPDFS_BLOCK_SIZE - le16_to_cpu(bt->tail_free);
-	struct rpdfs_btree_item *item = item_from_off(bt, off);
-	u16 bytes = aligned_item_size(val_size);
-
-	BUG_ON(ind >= RPDFS_BTREE_MAX_ITEMS);
-	BUG_ON(le16_to_cpu(bt->tail_free) - bytes > RPDFS_BTREE_MAX_FREE);
-	BUG_ON(le16_to_cpu(bt->total_free) - bytes > RPDFS_BTREE_MAX_FREE);
-
-	memmove_item_headers(bt, ind, 1);
-	le16_add_cpu(&bt->tail_free, -bytes);
-	le16_add_cpu(&bt->total_free, -bytes);
-	le16_add_cpu(&bt->nr_items, 1);
-	bt->ihdrs[ind].off = cpu_to_le16(off);
-	bt->ihdrs[ind].val_size = cpu_to_le16(val_size);
-
-	item->key = *key;
-	if (val_size)
-		memcpy_and_zero_tail(&item->val[0], ALIGN(val_size, RPDFS_BTREE_ITEM_ALIGN),
-				     val, val_size);
-
-	return item;
-}
-
-/*
- * Delete an item by removing its item header and zeroing its bytes.
- * This almost certainly leaves behind fragmented free space in the
- * block that will later be reclaimed by compaction.
- *
- * XXX There is the opportunity to remove internal fragmentation when
- * all the items have the same size.  If we could find the ind of the
- * last item before the tail free space then we could move it into the
- * space freed by the deletion, maintaining unfragmented items and free
- * space.  I'm not sure it's worth either searching for the key at that
- * offset or maintaining the metadata to always know the sort position
- * of the item at the last offset.
- */
-static void delete_item(struct rpdfs_btree_block *bt, u16 ind)
-{
-	struct rpdfs_btree_item *item = item_from_ind(bt, ind);
-	u16 bytes = aligned_item_size(item_val_size(bt, ind));
-	u16 off = le16_to_cpu(bt->ihdrs[ind].off);
-	u16 nr;
-
-	BUG_ON(le16_to_cpu(bt->tail_free) + bytes > RPDFS_BTREE_MAX_FREE);
-	BUG_ON(le16_to_cpu(bt->total_free) + bytes > RPDFS_BTREE_MAX_FREE);
-
-	if (off == RPDFS_BLOCK_SIZE - le16_to_cpu(bt->tail_free) - bytes)
-		le16_add_cpu(&bt->tail_free, bytes);
-	le16_add_cpu(&bt->total_free, bytes);
-
-	memmove_item_headers(bt, ind + 1, -1);
-	le16_add_cpu(&bt->nr_items, -1);
-
-	nr = le16_to_cpu(bt->nr_items);
-	memset(&bt->ihdrs[nr], 0, sizeof(struct rpdfs_btree_item_header));
-	memset(item, 0, bytes);
-}
-
-/*
- * Defragment internal free space by moving all the items towards the
- * front of the block, gathering all free space to the end.  We sort the
- * item headers by offset so we can move the items by iterating in
- * offset order.  Then we return the item headers to being sorted by
- * key.
- *
- * We could use per-cpu resources to have an external offset sort index,
+ * We could use per-cpu resources to have external offset sort index
  * but that could get obnoxious if the blocks got significantly larger
  * so we haven't bothered.  Compaction is rare so hopefully the doubled
  * sort cost isn't a problem.
  */
 static void compact_items(struct rpdfs_btree_block *bt)
 {
-	struct rpdfs_btree_item *item;
-	struct rpdfs_btree_item *dst;
+	void *src_val;
+	s32 ind;
+	u16 dst_off;
+	u16 src_off;
 	u16 bytes;
-	u16 ind;
-	u16 off;
 	u16 nr;
 
-	if (bt->nr_items == 0 || bt->tail_free == bt->total_free)
+	if (bt->nr_items == 0 || bt->avail_free == bt->total_free)
 		return;
 
 	nr = le16_to_cpu(bt->nr_items);
-	sort_r(bt->ihdrs, nr, sizeof(bt->ihdrs[0]), cmp_ihdr_off, NULL, bt);
+	sort(bt->items, nr, sizeof(bt->items[0]), cmp_item_off, NULL);
 
-	off = RPDFS_BLOCK_SIZE - RPDFS_BTREE_MAX_FREE;
-	for (ind = 0; ind < nr; ind++) {
-		item = item_from_ind(bt, ind);
-		bytes = aligned_item_size(item_val_size(bt, ind));
+	dst_off = RPDFS_BLOCK_SIZE;
+	for (ind = nr - 1; ind >= 0; ind--) {
+		src_off = item_off(bt, ind);
+		bytes = aligned_val_size(item_size(bt, ind));
+		dst_off -= bytes;
 
-		if (le16_to_cpu(bt->ihdrs[ind].off) != off) {
-			dst = item_from_off(bt, off);
-			bt->ihdrs[ind].off = cpu_to_le16(off);
-			memmove(dst, item, bytes);
+		if (src_off != dst_off) {
+			src_val = item_val(bt, ind);
+			set_item_off(bt, ind, dst_off);
+			memmove(item_val(bt, ind), src_val, bytes);
 		}
-
-		off += bytes;
 	}
 
-	/* zero newly free region before the existing free region at the tail */
-	bytes = le16_to_cpu(bt->total_free) - le16_to_cpu(bt->tail_free);
-	memset(item_from_off(bt, off), 0, bytes);
+	/* zero gathered free region before the now packed values */
+	bytes = le16_to_cpu(bt->total_free) - le16_to_cpu(bt->avail_free);
+	memzero_explicit((void *)bt + dst_off - bytes, bytes);
 
-	bt->tail_free = bt->total_free;
-	sort_r(bt->ihdrs, nr, sizeof(bt->ihdrs[0]), cmp_ihdr_key, NULL, bt);
+	bt->avail_free = bt->total_free;
+	sort(bt->items, nr, sizeof(bt->items[0]), cmp_item_key, NULL);
 }
 
 /*
- * The tree has a surprising invariant that I may live to regret: items
- * whose keys differ only by the least significant bit will be found in
- * the same leaf.  The separator key between nodes must have the LSB
- * set.
+ * Insert a new item by extending the item array and adding the value to
+ * the end of the available free space in the center of the block.  The
+ * caller ensured that there's total free space available for the item
+ * but we might have to compact to defragment it.
  *
- * We encode dirents with only one collision bit so that we can always
- * make dirent operation decisions by looking at a pair of items.  This
- * invariant ensures that we can find these items in one leaf.
- *
- * This test is being called while moving items as it decides to stop.
- * The invariant is violated, and moving must continue, if the items
- * straddling the two blocks have keys that only differ by the least
- * significant bit.
+ * Because we can compact we can move item values around.  Callers must
+ * not hold pointers to values across any calls that can insert into
+ * blocks.
  */
-static bool violating_lsb_pair_invariant(struct rpdfs_btree_block *dst,
-					 struct rpdfs_btree_block *src, bool to_right)
+static void insert_item_kvec(struct rpdfs_btree_block *bt, u16 ind, u64 key,
+			     struct kvec *kv, unsigned long nr_segs, u16 val_size)
 {
-	struct rpdfs_btree_item *s;
-	struct rpdfs_btree_item *d;
+	struct iov_iter iter;
+	size_t copied;
+	u16 bytes;
+	u16 off;
 
-	if (to_right) {
-		s = last_item(src);
-		d = first_item(dst);
-	} else {
-		s = first_item(src);
-		d = last_item(dst);
+	BUG_ON(ind > le16_to_cpu(bt->nr_items));
+	BUG_ON(val_size > RPDFS_BTREE_MAX_VAL_SIZE);
+	BUG_ON(!item_fits(bt->total_free, val_size));
+
+	if (!item_fits(bt->avail_free, val_size))
+		compact_items(bt);
+
+	bytes = full_item_size(val_size);
+	off = free_val_off(bt, val_size);
+
+	memmove_items(bt, ind, 1);
+
+	le16_add_cpu(&bt->avail_free, -bytes);
+	le16_add_cpu(&bt->total_free, -bytes);
+	le16_add_cpu(&bt->nr_items, 1);
+
+	bt->items[ind] = pack_item(key, off, val_size);
+
+	if (val_size) {
+		iov_iter_kvec(&iter, ITER_SOURCE, kv, nr_segs, val_size);
+		copied = copy_from_iter(item_val(bt, ind), val_size, &iter);
+		BUG_ON(copied != val_size); /* no user */
 	}
+}
 
-	return (s->key.msq == d->key.msq) &&
-	       ((s->key.lsq ^ d->key.lsq) == cpu_to_le64(1));
+static void insert_item_val(struct rpdfs_btree_block *bt, u16 ind, u64 key,
+			    void *val, u16 val_size)
+{
+	struct kvec kv = { .iov_base = val, .iov_len = val_size };
+
+	insert_item_kvec(bt, ind, key, &kv, 1, val_size);
+}
+
+static void insert_item_item(struct rpdfs_btree_block *bt, u16 ind,
+			     struct rpdfs_btree_block *src, u16 src_ind)
+{
+	return insert_item_val(bt, ind, item_key(src, src_ind), item_val(src, src_ind),
+			       item_size(src, src_ind));
+}
+
+/*
+ * Delete an item by removing its item header and zeroing its value
+ * bytes.
+ *
+ * This almost certainly leaves behind fragmented free space in the
+ * block that will later be reclaimed by compaction.
+ */
+static void delete_item(struct rpdfs_btree_block *bt, u16 ind)
+{
+	u16 bytes;
+	u16 off;
+
+	BUG_ON(ind >= le16_to_cpu(bt->nr_items));
+
+	/* zero the value */
+	bytes = item_size(bt, ind);
+	if (bytes)
+		memzero_explicit(item_val(bt, ind), bytes);
+
+	/* update free tracking */
+	off = item_off(bt, ind);
+	bytes = full_item_size(item_size(bt, ind));
+	if (off == free_val_off(bt, 0))
+		le16_add_cpu(&bt->avail_free, bytes);
+	else
+		le16_add_cpu(&bt->avail_free, sizeof_field(struct rpdfs_btree_block, items[0]));
+	le16_add_cpu(&bt->total_free, bytes);
+
+	/* remove the item and update item count */
+	memmove_items(bt, ind + 1, -1);
+	le16_add_cpu(&bt->nr_items, -1);
+	bt->items[le16_to_cpu(bt->nr_items)] = 0;
+}
+
+/*
+ * The caller is moving items between blocks and wants to know if
+ * collisions for the same base key are found in both blocks.  It will
+ * keep moving until all the collisions are moved to the destination.
+ */
+static bool split_key_collisions(struct rpdfs_btree_block *dst, struct rpdfs_btree_block *src,
+				 bool to_right)
+{
+	u16 s = to_right ? last_ind(src) : 0;
+	u16 d = to_right ? 0 : last_ind(dst);
+
+	return key_no_coll(item_key(src, s)) == key_no_coll(item_key(dst, d));
 }
 
 /*
  * Move items from the source block to the destination block.
- *
- * We need to compact the destination before we move so that there's
- * room for the moving items.  This is used by splitting and merging
- * which also has to ensure that both of its output blocks are
- * sufficiently compacted to receive an insertion.  We always compact
- * the source after moving items.
  *
  * @to_right moves items in descending order from the end of the src
  * block to the front of the dst block.  When false it moves in the
@@ -440,21 +427,17 @@ static bool violating_lsb_pair_invariant(struct rpdfs_btree_block *dst,
  *
  * @until_balanced stops moving once the consumed space in the two
  * blocks are roughly equal, rather than trying to move all items from
- * src to dst.  It checks after moving each item, and potentially must
- * move an additional item to maintain our separator key invariant, so
- * the balance can be off by two max items at most.
+ * src to dst.  It checks after moving each item and might need to keep
+ * moving so it doesn't split colliding keys across blocks.
  */
 static void move_items(struct rpdfs_btree_block *dst, struct rpdfs_btree_block *src,
 		       bool to_right, bool until_balanced)
 {
-	struct rpdfs_btree_item *item;
 	u16 src_ind;
 	u16 dst_ind;
 
 	if (src->nr_items == 0)
 		return;
-
-	compact_items(dst);
 
 	if (to_right) {
 		src_ind = le16_to_cpu(src->nr_items) - 1;
@@ -465,13 +448,12 @@ static void move_items(struct rpdfs_btree_block *dst, struct rpdfs_btree_block *
 	}
 
 	while (src->nr_items != 0) {
-		item = item_from_ind(src, src_ind);
-		insert_item(dst, dst_ind, &item->key, item->val, item_val_size(src, src_ind));
+		insert_item_item(dst, dst_ind, src, src_ind);
 		delete_item(src, src_ind);
 
 		if (until_balanced &&
 		    (le16_to_cpu(dst->total_free) <= le16_to_cpu(src->total_free)) &&
-		    !violating_lsb_pair_invariant(dst, src, to_right))
+		    !split_key_collisions(dst, src, to_right))
 			break;
 
 		if (to_right)
@@ -481,39 +463,17 @@ static void move_items(struct rpdfs_btree_block *dst, struct rpdfs_btree_block *
 	}
 }
 
-/*
- * The ordered blocks have had items moved between them.  Reset their
- * inner last,first key range boundary to reflect the key of the last
- * item in the left block.
- *
- * This also has to maintain our separator invariant.  Item motion has
- * ensured that it's safe for us to always set the lsb of the separator
- * key. (see violating_lsb_pair_invariant()).
- */
-static void reset_key_range_boundary(struct rpdfs_btree_block *left,
-				     struct rpdfs_btree_block *right)
-{
-	BUG_ON(rpdfs_btree_key_cmp(&left->first, &right->last) >= 0);
-
-	left->last = last_item(left)->key;
-	left->last.lsq |= cpu_to_le64(1);
-	right->first = left->last;
-	rpdfs_btree_key_inc(&right->first);
-}
-
 static int copy_item_ref(struct rpdfs_btree_block *bt, u16 ind, struct rpdfs_block_ref *ref)
 {
 	const u16 sz = sizeof(struct rpdfs_block_ref);
-	struct rpdfs_btree_item *item;
 
 	if (ind >= le16_to_cpu(bt->nr_items))
 		return -EUCLEAN;
 
-	if (item_val_size(bt, ind) != sz)
+	if (item_size(bt, ind) != sz)
 		return -EUCLEAN;
 
-	item = item_from_ind(bt, ind);
-	memcpy(ref, item->val, sz);
+	memcpy(ref, item_val(bt, ind), sz);
 	return 0;
 }
 
@@ -521,28 +481,45 @@ static int copy_item_ref(struct rpdfs_btree_block *bt, u16 ind, struct rpdfs_blo
  * Given a parent btree block, set the caller's reference to the child
  * block that will contain the search key.
  */
-int rpdfs_btree_find_child_ref(struct rpdfs_btree_block *bt, struct rpdfs_btree_key *key,
+int rpdfs_btree_find_child_ref(struct rpdfs_btree_block *bt, u64 key, u64 *ref_key,
 			       struct rpdfs_block_ref *ref)
 {
 	u16 ind = find_key_ind(bt, key);
 
+	*ref_key = item_key(bt, ind);
 	return copy_item_ref(bt, ind, ref);
 }
 
-int rpdfs_btree_find_child_and_sib_ref(struct rpdfs_btree_block *bt, struct rpdfs_btree_key *key,
-				       struct rpdfs_block_ref *ref,
-				       struct rpdfs_block_ref *sib_ref)
+/*
+ * Fill the references to the blocks that are on either side of the
+ * block that contains the key.  When a block doesn't exist on either
+ * side the corresponding reference is zeroed.
+ */
+int rpdfs_btree_find_sib_refs(struct rpdfs_btree_block *bt, u64 key, struct rpdfs_block_ref *left,
+			      struct rpdfs_block_ref *right)
 {
 	u16 ind = find_key_ind(bt, key);
-	int ret;
+	int ret = 0;
 
-	ret = copy_item_ref(bt, ind, ref);
-	if (ret == 0) {
-		ind = ind > 0 ? ind - 1 : ind + 1;
-		ret = copy_item_ref(bt, ind, sib_ref);
-	}
+	if (ind > 0)
+		ret = copy_item_ref(bt, ind - 1, left);
+	else
+		*left = (struct rpdfs_block_ref) {0,};
+
+	if ((ind + 1) < le16_to_cpu(bt->nr_items))
+		ret = ret ?: copy_item_ref(bt, ind + 1, right);
+	else
+		*right = (struct rpdfs_block_ref) {0,};
 
 	return ret;
+}
+
+/*
+ * Parent keys must always include all the collision bits.
+ */
+static u64 parent_ref_key(struct rpdfs_btree_block *child)
+{
+	return rpdfs_btree_last_key(child) | RPDFS_BTREE_KEY_COLL_MASK;
 }
 
 /*
@@ -553,28 +530,28 @@ int rpdfs_btree_find_child_and_sib_ref(struct rpdfs_btree_block *bt, struct rpdf
  * a new parent item and don't have to modify the existing parent item's
  * key.
  */
-int rpdfs_btree_split(struct rpdfs_fs_info *rfi, struct rpdfs_btree_root *root,
-		      struct rpdfs_block_ref *par_ref, struct rpdfs_btree_block *parent,
-		      struct rpdfs_block_ref *sib_ref, struct rpdfs_btree_block *sib,
-		      struct rpdfs_block_ref *ref, struct rpdfs_btree_block *bt)
+void rpdfs_btree_split(struct rpdfs_fs_info *rfi, struct rpdfs_btree_root *root,
+		       struct rpdfs_block_ref *par_ref, struct rpdfs_btree_block *parent,
+		       struct rpdfs_block_ref *sib_ref, struct rpdfs_btree_block *sib,
+		       struct rpdfs_block_ref *ref, struct rpdfs_btree_block *bt)
 {
+	u64 key;
+
 	/* link in allocated parent if we're splitting first block */
 	if (root->ref.bnr == ref->bnr) {
-		init_block(parent, bt->level + 1, &bt->first, &bt->last);
+		init_block(parent, bt->level + 1);
+		insert_item_val(parent, 0, RPDFS_BTREE_ITEM_KEY_MASK,
+				ref, sizeof(struct rpdfs_block_ref));
 		root->ref = *par_ref;
-		insert_item(parent, 0, &bt->last, ref, sizeof(struct rpdfs_block_ref));
+		root->height++;
 	}
 
-	init_block(sib, bt->level, &bt->first, &bt->last);
+	init_block(sib, bt->level);
 	move_items(sib, bt, false, true);
-	reset_key_range_boundary(sib, bt);
 
-	if (should_compact(parent, sizeof(struct rpdfs_block_ref)))
-		compact_items(parent);
-	insert_item(parent, find_key_ind(parent, &sib->last), &sib->last, sib_ref,
-		    sizeof(struct rpdfs_block_ref));
-
-	return 0;
+	key = parent_ref_key(sib);
+	insert_item_val(parent, find_key_ind(parent, key), key, sib_ref,
+			sizeof(struct rpdfs_block_ref));
 }
 
 /*
@@ -582,298 +559,226 @@ int rpdfs_btree_split(struct rpdfs_fs_info *rfi, struct rpdfs_btree_root *root,
  * if there is a parent block so there must be at least one sibling.
  *
  * Our block can be on either spine of the tree so we need to be able to
- * pull from a neighbor on either side.  We have to update the key in
- * the parent reference item that separates the items in the two child
+ * pull from a sibling on either side.  We have to update the key in the
+ * parent reference item that separates the items in the two child
  * blocks, regardless.
  *
  * This can remove the sibling or parent from the tree.  If the sibling
  * loses its items it's removed and then if the parent only has one
- * remaining item it's removed.  The item counts in the block buffers
- * remain at those values for the caller to discover that this has
- * happened.
+ * remaining item it's also removed.  The caller can see blocks with no
+ * items and free them in this case.
  */
-int rpdfs_btree_merge(struct rpdfs_fs_info *rfi, struct rpdfs_btree_root *root,
-		      struct rpdfs_btree_block *par_bt, struct rpdfs_btree_block *sib_bt,
-		      struct rpdfs_btree_block *bt)
+void rpdfs_btree_merge(struct rpdfs_fs_info *rfi, struct rpdfs_btree_root *root,
+		       struct rpdfs_btree_block *parent, struct rpdfs_btree_block *sib,
+		       struct rpdfs_btree_block *bt)
 {
-	struct rpdfs_btree_item *sib_ref_item;
-	struct rpdfs_btree_item *ref_item;
 	bool until_balanced;
 	bool to_right;
 	u16 sib_ind;
-	u16 bt_ind;
+	u16 ind;
+
+	/* caller must have checked */
+	BUG_ON(!rpdfs_btree_should_merge(bt));
 
 	/* find our and sibling ref items */
-	bt_ind = find_key_ind(par_bt, &bt->first);
-	to_right = bt_ind > 0;
-	sib_ind = to_right ? bt_ind - 1 : bt_ind + 1;
-
-	ref_item = item_from_ind(par_bt, bt_ind);
-	sib_ref_item = item_from_ind(par_bt, sib_ind);
-
-	/*
-	 * Balance items between blocks if the result is two blocks
-	 * whose average of free space is less than the merge free
-	 * threshold, otherwise merge them.
-	 */
-	until_balanced = (le16_to_cpu(bt->total_free) + le16_to_cpu(sib_bt->total_free)) <
-			 (RPDFS_BTREE_MERGE_FREE_THRESH * 2);
-
-	/* expand our range for insertion assertions, will keep if we empty sib */
-	if (to_right)
-		bt->first = sib_bt->first;
+	ind = find_key_ind(parent, rpdfs_btree_last_key(bt));
+	if (rpdfs_btree_last_key(bt) < rpdfs_btree_last_key(sib))
+		sib_ind = ind + 1;
 	else
-		bt->last = sib_bt->last;
+		sib_ind = ind - 1;
+	to_right = sib_ind < ind;
 
-	move_items(bt, sib_bt, to_right, until_balanced);
+	/* balance items between blocks if our sibling hasn't hit the merge threshold */
+	until_balanced = !rpdfs_btree_should_merge(sib);
 
-	/* if sib has items then update mid separator and maybe update sib ref */
-	if (sib_bt->nr_items != 0) {
-		if (to_right)
-			reset_key_range_boundary(sib_bt, bt);
+	move_items(bt, sib, to_right, until_balanced);
+
+	/* update sib ref if it's still live and its last key changed */
+	if (sib->nr_items != 0 && to_right)
+		set_item_key(parent, sib_ind, parent_ref_key(sib));
+
+	/* update our ref key if our last changed, using emptied sibs in case max */
+	if (!to_right) {
+		if (sib->nr_items == 0)
+			set_item_key(parent, ind, item_key(parent, sib_ind));
 		else
-			reset_key_range_boundary(bt, sib_bt);
-		if (to_right)
-			sib_ref_item->key = sib_bt->last;
+			set_item_key(parent, ind, parent_ref_key(bt));
 	}
-
-	/* update our key if our last changed */
-	if (!to_right)
-		ref_item->key = bt->last;
 
 	/* delete ref to empty sibling, maybe also drop parent with single ref to us */
-	if (sib_bt->nr_items == 0) {
-		delete_item(par_bt, sib_ind);
-		if (le16_to_cpu(par_bt->nr_items) == 1) {
-			copy_item_ref(par_bt, 0, &root->ref);
+	if (sib->nr_items == 0) {
+		delete_item(parent, sib_ind);
+		if (le16_to_cpu(parent->nr_items) == 1) {
+			copy_item_ref(parent, 0, &root->ref);
 			root->height = bt->level + 1;
+			delete_item(parent, 0);
 		}
 	}
-
-	return 0;
 }
 
-void rpdfs_btree_key_set_min(struct rpdfs_btree_key *key)
+static int call_item_cb(struct rpdfs_fs_info *rfi, struct rpdfs_btree_block *bt, u16 ind,
+			rpdfs_btree_item_cb_t cb, void *arg)
 {
-	*key = min_key;
+	return cb(rfi, item_key(bt, ind), item_val(bt, ind), item_size(bt, ind), arg);
 }
 
-bool rpdfs_btree_key_is_min(struct rpdfs_btree_key *key)
-{
-	return rpdfs_btree_key_cmp(key, &min_key) == 0;
-}
+#define for_each_item(bt_, key_, ind_) \
+	for (ind_ = find_key_ind(bt_, key_); ind_ < le16_to_cpu(bt_->nr_items); ind_++)
 
-void rpdfs_btree_key_set_max(struct rpdfs_btree_key *key)
-{
-	*key = max_key;
-}
+#define for_each_key_collision_from(bt_, key_, ind_, from_) \
+	for (ind_ = from_; \
+	     (ind_ < le16_to_cpu(bt_->nr_items)) && \
+		   (key_no_coll(key_) == key_no_coll(item_key(bt_, ind_))); \
+	     ind_++)
 
-bool rpdfs_btree_key_is_max(struct rpdfs_btree_key *key)
-{
-	return rpdfs_btree_key_cmp(key, &max_key) == 0;
-}
+#define for_each_key_collision(bt_, key_, ind_) \
+	for_each_key_collision_from(bt_, key_, ind_, find_key_ind(bt_, key_no_coll(key_)))
 
-void rpdfs_btree_key_inc(struct rpdfs_btree_key *key)
+static inline bool invalid_key(u64 key)
 {
-	le64_add_cpu(&key->lsq, 1);
-	if (key->lsq == 0)
-		le64_add_cpu(&key->msq, 1);
-}
-
-int rpdfs_btree_key_cmp(const struct rpdfs_btree_key *a, const struct rpdfs_btree_key *b)
-{
-	return rpdfs_compare(le64_to_cpu(a->msq), le64_to_cpu(b->msq)) ?:
-	       rpdfs_compare(le64_to_cpu(a->lsq), le64_to_cpu(b->lsq));
+	return WARN_ON_ONCE(key & ~RPDFS_BTREE_ITEM_KEY_MASK) != 0;
 }
 
 /*
- * Lookup a key in the block.  Call the caller's callback with as many
- * items as exist in the block from the key.
- */
-int rpdfs_btree_lookup_cb(struct rpdfs_fs_info *rfi, struct rpdfs_btree_block *bt,
-			  struct rpdfs_btree_key *key, rpdfs_btree_item_cb_t item_cb,
-			  void *cb_arg)
-{
-	struct rpdfs_btree_item_args a;
-	struct rpdfs_btree_item_args b;
-	struct rpdfs_btree_item_args c;
-	u16 ind;
-
-	ind = find_key_ind(bt, key);
-	init_bti(&a, bt, ind);
-	init_bti(&b, bt, ind + 1);
-	init_bti(&c, bt, ind + 2);
-
-	return item_cb(rfi, &a, &b, &c, cb_arg);
-}
-
-/*
- * Insert an item as described through a callback.
+ * Call the callback on all the items whose keys collide with the
+ * caller's.  If the caller has acquired a write handle on the block
+ * then it can modify the item value in the callback but can't change
+ * its size.
  *
- * In the callback, a and b may be existing items in the tree.  If 0 is
- * returned then c must describe the item to be inserted.  c's insertion
- * key must be >= the search key, != a's key, and < b's key.
+ * If the callback only returns -ELOOP then -ENOENT is returned as this
+ * is used to look for specific items.
  */
-int rpdfs_btree_insert_cb(struct rpdfs_fs_info *rfi, struct rpdfs_btree_block *bt,
-			  struct rpdfs_btree_key *key, rpdfs_btree_item_cb_t item_cb,
-			  void *cb_arg)
+int rpdfs_btree_collisions_cb(struct rpdfs_fs_info *rfi, struct rpdfs_btree_block *bt,
+			      u64 key, rpdfs_btree_item_cb_t cb, void *arg)
 {
-	struct rpdfs_btree_item_args ins;
-	struct rpdfs_btree_item_args a;
-	struct rpdfs_btree_item_args b;
 	u16 ind;
-	int cmp;
 	int ret;
 
-	ind = find_key_ind(bt, key);
-	init_bti(&a, bt, ind);
-	init_bti(&b, bt, ind + 1);
-
-	ret = item_cb(rfi, &a, &b, &ins, cb_arg);
-	if (ret == 0) {
-		cmp = rpdfs_btree_key_cmp(&ins.key, &a.key);
-		if (WARN_ON_ONCE(rpdfs_btree_key_cmp(&ins.key, key) < 0 || cmp == 0 ||
-				 rpdfs_btree_key_cmp(&ins.key, &b.key) > 0)) {
-			ret = -EINVAL;
-		} else {
-			if (cmp > 0)
-				ind++;
-			if (should_compact(bt, ins.val_size))
-				compact_items(bt);
-			insert_item(bt, ind, &ins.key, ins.val, ins.val_size);
-		}
+	if (invalid_key(key)) {
+		ret = -EINVAL;
+		goto out;
 	}
 
+	for_each_key_collision(bt, key, ind) {
+		ret = call_item_cb(rfi, bt, ind, cb, arg);
+		if (ret != -ELOOP)
+			goto out;
+	}
+
+	ret = -ENOENT;
+out:
 	return ret;
 }
 
 /*
- * Delete an item as described by a callback.  The callback is given the
- * next three items in a leaf whose keys are greater than or equal to
- * the search key.  The callback returns errors or a positive index of
- * the item to delete, with 0 indicating a.
+ * Insert an item.  If the callback never returns an error then we'll
+ * insert at the next available collision.  -EXFULL is returned if we
+ * run out of collision bits.
  *
- * The caller must deal with the callback arguments being limited to a
- * leaf block. They're not necessarily the next three keys in the btree.
- * If there are fewer than 3 items in the block after the search key
- * then the later bti arguments will have their key set to max and the
- * cb must not try to delete them.
+ * We can't insert if we haven't visited all the collisions.  It'd be
+ * confusing to return >= 0 success without inserting so we warn if the
+ * callback does so.
+ */
+int rpdfs_btree_insert_cb(struct rpdfs_fs_info *rfi, struct rpdfs_btree_block *bt, u64 key,
+			  rpdfs_btree_item_cb_t cb, void *arg, struct kvec *kv,
+			  unsigned long nr_segs, u16 val_size)
+{
+	u64 coll;
+	u16 base;
+	u16 ind;
+	int ret;
+
+	if (invalid_key(key) || WARN_ON_ONCE(!item_fits(bt->total_free, val_size))) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	/* ignore caller's collision bits */
+	coll = 0;
+	base = find_key_ind(bt, key_no_coll(key));
+	for_each_key_collision_from(bt, key, ind, base) {
+		ret = call_item_cb(rfi, bt, ind, cb, arg);
+		if (ret != -ELOOP) {
+			WARN_ON_ONCE(ret >= 0);
+			goto out;
+		}
+
+		if (coll == key_coll(item_key(bt, ind))) {
+			if (++coll > RPDFS_BTREE_KEY_COLL_MASK) {
+				ret = -EXFULL;
+				goto out;
+			}
+		}
+	}
+
+	insert_item_kvec(bt, base + coll, key_no_coll(key) | coll, kv, nr_segs, val_size);
+	ret = 0;
+out:
+	return ret;
+}
+
+/*
+ * Delete an item when the callback returns success.  If the callback
+ * only returns -ELOOP then we return -ENOENT.
  */
 int rpdfs_btree_delete_cb(struct rpdfs_fs_info *rfi, struct rpdfs_btree_root *root,
-			  struct rpdfs_btree_block *bt, struct rpdfs_btree_key *key,
-			  rpdfs_btree_item_cb_t item_cb, void *cb_arg)
+			  struct rpdfs_btree_block *bt, u64 key, rpdfs_btree_item_cb_t cb,
+			  void *arg)
 {
-	struct rpdfs_btree_item_args a;
-	struct rpdfs_btree_item_args b;
-	struct rpdfs_btree_item_args c;
 	u16 ind;
 	int ret;
 
-	ind = find_key_ind(bt, key);
-	init_bti(&a, bt, ind);
-	init_bti(&b, bt, ind + 1);
-	init_bti(&c, bt, ind + 2);
-
-	ret = item_cb(rfi, &a, &b, &c, cb_arg);
-	if (WARN_ON_ONCE(ret >= 0 && (ret >= 3 || (ind + ret) >= le16_to_cpu(bt->nr_items))))
+	if (invalid_key(key)) {
 		ret = -EINVAL;
-	if (ret >= 0) {
-		delete_item(bt, ind + ret);
-		if (bt->nr_items == 0) {
-			memset(&root->ref, 0, sizeof(struct rpdfs_block_ref));
-			root->height = 0;
+		goto out;
+	}
+
+	for_each_key_collision(bt, key, ind) {
+		ret = call_item_cb(rfi, bt, ind, cb, arg);
+		if (ret != -ELOOP) {
+			if (ret >= 0) {
+				delete_item(bt, ind);
+				if (bt->nr_items == 0)
+					memzero_explicit(root, sizeof(struct rpdfs_btree_root));
+			}
+			goto out;
 		}
 	}
 
+	ret = -ENOENT;
+out:
 	return ret;
 }
 
 /*
- * The caller's callback is given a pointer to the next item from the
- * search key.  The callback can modify only the contents of the value
- * of that item, or return an error.
+ * Call the callback for each item in the block, sorted by key, starting
+ * with the caller's key.  This works with full precision keys.
+ *
+ * This is used to iterate over all the items in the block so it
+ * directly returns the last callback return.  The caller can see -ELOOP
+ * to indicate if it should continue from the next leaf block of items.
+ *
+ * The caller's key can end in the leaf block after all keys so we won't
+ * call the callback.  We default to returning -ELOOP to advance to the
+ * next leaf.
  */
-int rpdfs_btree_modify_cb(struct rpdfs_fs_info *rfi, struct rpdfs_btree_block *bt,
-			  struct rpdfs_btree_key *key, rpdfs_btree_item_cb_t item_cb,
-			  void *cb_arg)
+int rpdfs_btree_items_cb(struct rpdfs_fs_info *rfi, struct rpdfs_btree_block *bt, u64 key,
+			 rpdfs_btree_item_cb_t cb, void *arg)
 {
-	struct rpdfs_btree_item_args a;
 	u16 ind;
 	int ret;
 
-	ind = find_key_ind(bt, key);
-	if (ind >= le16_to_cpu(bt->nr_items)) {
-		ret = -ENOENT;
-	} else {
-		init_bti(&a, bt, ind);
-		ret = item_cb(rfi, &a, NULL, NULL, cb_arg);
+	if (invalid_key(key)) {
+		ret = -EINVAL;
+		goto out;
 	}
 
-	return ret;
-}
-
-static size_t copied_bti_size(u16 val_size)
-{
-	/* surely alignment must be a power of two.. */
-	BUILD_BUG_ON(!is_power_of_2(__alignof__(struct rpdfs_btree_item_args)));
-
-	return ALIGN(sizeof(struct rpdfs_btree_item_args) + val_size,
-		     __alignof__(struct rpdfs_btree_item_args));
-}
-
-/*
- * Copy items from the block into contiguous rpdfs_btree_item_args
- * structs in the caller's buffer.  They can then iterate over the
- * copied items.
- *
- * The buffer must be aligned so the bti struct.  The number of copied
- * items is returned.
- *
- * The buffer must fit a maximum size item.  This avoids the error case
- * where the caller couldn't get their first item because it didn't fit.
- * Each call either gets items or has run out of items.
- */
-int rpdfs_btree_copy_items(struct rpdfs_fs_info *rfi, struct rpdfs_btree_block *bt,
-			   struct rpdfs_btree_key *key, void *buf, size_t size)
-{
-	struct rpdfs_btree_item_args *bti;
-	struct rpdfs_btree_item *item;
-	size_t bti_size;
-	u16 val_size;
-	u16 ind;
-	int ret;
-
-	if (WARN_ON_ONCE(!IS_ALIGNED((unsigned long)buf,
-				     __alignof__(struct rpdfs_btree_item_args))) ||
-	    WARN_ON_ONCE(size < copied_bti_size(RPDFS_BTREE_MAX_VAL_SIZE)))
-		return -EINVAL;
-
-	ret = 0;
-	for (ind = find_key_ind(bt, key); ind < le16_to_cpu(bt->nr_items); ind++) {
-
-		val_size = item_val_size(bt,  ind);
-		bti_size = copied_bti_size(val_size);
-		if (size < bti_size)
+	ret = -ELOOP;
+	for_each_item(bt, key, ind) {
+		ret = call_item_cb(rfi, bt, ind, cb, arg);
+		if (ret != -ELOOP)
 			break;
-
-		bti = buf;
-		item = item_from_ind(bt, ind);
-
-		bti->key = item->key;
-		bti->val = (bti + 1);
-		bti->val_size = val_size;
-		if (val_size)
-			memcpy(bti->val, item->val, val_size);
-
-		buf += bti_size;
-		size -= bti_size;
-		ret++;
 	}
-
+out:
 	return ret;
-}
-
-struct rpdfs_btree_item_args *rpdfs_btree_next_copied_item(struct rpdfs_btree_item_args *bti)
-{
-	return (void *)bti + copied_bti_size(bti->val_size);
 }
