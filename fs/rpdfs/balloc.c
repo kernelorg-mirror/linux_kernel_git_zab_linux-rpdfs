@@ -78,47 +78,26 @@ void rpdfs_balloc_set_stripe_bits(struct rpdfs_balloc_region *reg, unsigned long
 	}
 }
 
-/*
- * Return the next free block, starting at the given position.  If we
- * find one then set the position to one past what we found.
- *
- * Returns -ENOSPC if there are none available from the position.
- */
-int rpdfs_balloc_find_next(struct rpdfs_balloc_region *reg, unsigned long *pos, u64 *bnr_ret)
+int rpdfs_balloc_alloc_bnr(struct rpdfs_balloc_region *reg, u64 *bnr_ret)
 {
 	unsigned long b;
 	int ret;
 
-	b = find_next_bit(reg->bits, reg->size, max(*pos, reg->first_set));
+	b = find_next_bit(reg->bits, reg->size, reg->first_set);
 	if (b >= reg->size) {
-		*pos = reg->size;
 		ret = -ENOSPC;
 	} else {
-		*pos = b + 1;
+		clear_bit(b, reg->bits);
+		reg->first_set = b + 1;
+		reg->nr_set--;
+
 		*bnr_ret = reg->base_bnr + b;
 		ret = 0;
 	}
 
-	rpdfs_prd(REGF" bnr %llu ret %d after_pos %lu", REGA(reg), *bnr_ret, ret, *pos);
+	rpdfs_prd(REGF" bnr %llu ret %d", REGA(reg), *bnr_ret, ret);
 
 	return ret;
-}
-
-void rpdfs_balloc_clear(struct rpdfs_balloc_region *reg, u64 bnr)
-{
-	int b = bnr - reg->base_bnr;
-
-	if (WARN_ON_ONCE(bnr < reg->base_bnr || bnr >= (reg->base_bnr + reg->size) ||
-			 !test_bit(b, reg->bits)))
-		return;
-
-	rpdfs_prd(REGF" bnr %llu", REGA(reg), bnr);
-
-	clear_bit(b, reg->bits);
-	if (reg->first_set == b)
-		reg->first_set++;
-	reg->nr_set--;
-
 }
 
 /*
