@@ -455,64 +455,48 @@ int rpdfs_getattr(struct mnt_idmap *idmap, const struct path *path,
 	struct inode *inode = d_inode(path->dentry);
 	struct rpdfs_fs_info *rfi = RPDFS_INODE_FS(inode);
 	struct rpdfs_block_handle *hnd = NULL;
-	DECLARE_RPDFS_TXN(txn);
+	struct rpdfs_inode *rinode;
 	int ret;
 
-	do {
-		ret = rpdfs_inode_txn_prepare(rfi, &txn, inode, 0);
-	} while (rpdfs_txn_retry(rfi, &txn, &ret));
-
+	ret = rpdfs_inode_acquire(rfi, inode, &hnd, 0);
 	if (ret < 0)
 		goto out;
 
 	if (request_mask & STATX_BTIME) {
-		struct rpdfs_inode *rinode;
-
-		ret = rpdfs_txn_use_prepared(rfi, &txn, rpdfs_inode_bnr(inode),
-					     &hnd, 0);
-		if (ret < 0)
-			goto out;
-
 		rinode = hnd->data;
-
 		stat->result_mask |= STATX_BTIME;
 		stat->btime = ns_to_timespec64(le64_to_cpu(rinode->crtime_nsec));
 	}
 
 	generic_fillattr(idmap, request_mask, inode, stat);
-
 out:
-	rpdfs_txn_reset(rfi, &txn);
+	rpdfs_block_release(rfi, &hnd);
 
 	return ret;
 }
 
-int rpdfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
-		  struct iattr *attr)
+int rpdfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr *attr)
 {
 	struct inode *inode = d_inode(dentry);
 	struct rpdfs_fs_info *rfi = RPDFS_INODE_FS(inode);
-	DECLARE_RPDFS_TXN(txn);
+	struct rpdfs_transaction txn = RPDFS_INIT_TXN;
+	struct rpdfs_block_handle *hnd = NULL;
 	int ret;
 
-	do {
-		ret = rpdfs_inode_txn_prepare(rfi, &txn, inode, RBAF_WRITE);
-	} while (rpdfs_txn_retry(rfi, &txn, &ret));
-
+	ret = rpdfs_inode_acquire(rfi, inode, &hnd, RBAF_WRITE);
 	if (ret < 0)
 		goto out;
 
 	ret = setattr_prepare(idmap, dentry, attr);
-	if (ret)
-		goto out;
-
-	setattr_copy(idmap, inode, attr);
-	inode_inc_iversion(inode);
-
-	rpdfs_inode_txn_update(rfi, &txn, inode);
+	if (ret == 0) {
+		setattr_copy(idmap, inode, attr);
+		inode_inc_iversion(inode);
+		rpdfs_inode_update_dirty(rfi, &txn, inode, hnd);
+	}
 
 out:
-	rpdfs_txn_reset(rfi, &txn);
+	rpdfs_block_release(rfi, &hnd);
+	rpdfs_txn_finish(rfi, &txn);
 
 	return ret;
 }
