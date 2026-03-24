@@ -4,6 +4,8 @@
 
 #include <linux/fs.h>
 
+struct rpdfs_transaction;
+
 #include "format-block.h"
 #include "block.h"
 #include "txn.h"
@@ -11,7 +13,7 @@
 struct rpdfs_inode_info {
 	u64 ino;
 
-	/* updating vfs inode while preparing read references to blocks */
+	/* updating vfs inode when wcount is older than block contents */
 	seqlock_t refresh_seqlock;
 	u64 refresh_wcount;
 
@@ -28,7 +30,7 @@ struct rpdfs_inode_info {
 	struct inode vfs_inode;
 };
 
-static inline struct rpdfs_inode_info *RPDFS_I(struct inode *inode)
+static inline struct rpdfs_inode_info *RPDFS_I(const struct inode *inode)
 {
 	return container_of(inode, struct rpdfs_inode_info, vfs_inode);
 }
@@ -43,7 +45,7 @@ static inline u64 rpdfs_ino_bnr(u64 bnr)
 	return bnr;
 }
 
-static inline u64 rpdfs_inode_ino(struct inode *inode)
+static inline u64 rpdfs_inode_ino(const struct inode *inode)
 {
 	return le64_to_cpu(RPDFS_I(inode)->ig.ino);
 }
@@ -68,10 +70,15 @@ int rpdfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 
 struct inode *rpdfs_iget(struct super_block *sb, struct rpdfs_ino_gen *ig);
 struct inode *rpdfs_new_inode(struct super_block *sb, struct rpdfs_ino_gen *ig);
-int rpdfs_inode_txn_prepare(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
-			    struct inode *inode, rbaf_t rbaf);
-void rpdfs_inode_txn_update(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
-			    struct inode *inode);
+int rpdfs_inode_acquire_ordered(struct rpdfs_fs_info *rfi,
+				struct inode *a, struct rpdfs_block_handle **a_hnd,
+				struct inode *b, struct rpdfs_block_handle **b_hnd,
+				struct inode *c, struct rpdfs_block_handle **c_hnd,
+				struct inode *d, struct rpdfs_block_handle **d_hnd, rbaf_t rbaf);
+int rpdfs_inode_acquire(struct rpdfs_fs_info *rfi, struct inode *inode,
+			struct rpdfs_block_handle **hnd_ret, rbaf_t rbaf);
+void rpdfs_inode_update_dirty(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
+			      struct inode *inode, struct rpdfs_block_handle *hnd);
 
 int rpdfs_inode_init(void);
 void rpdfs_inode_exit(void);

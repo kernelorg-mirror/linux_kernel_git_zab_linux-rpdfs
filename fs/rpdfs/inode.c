@@ -5,8 +5,10 @@
 #include <linux/rcupdate.h>
 #include <linux/writeback.h>
 #include <linux/iversion.h>
+#include <linux/sort.h>
 
 #include "btree.h"
+#include "compare.h"
 #include "dir.h"
 #include "file.h"
 #include "inode.h"
@@ -140,8 +142,8 @@ static u64 ts64_to_ns(struct timespec64 ts)
  * is more recent.  A lot of tasks can be checking a shared inode to see
  * if it should be updated, so we want the negative test to be cheap.
  */
-static void rpdfs_inode_refresh(struct rpdfs_fs_info *rfi, struct rpdfs_block_handle *hnd,
-				struct inode *inode)
+static void rpdfs_inode_refresh(struct rpdfs_fs_info *rfi, struct inode *inode,
+				struct rpdfs_block_handle *hnd)
 {
 	struct rpdfs_inode_info *ri = RPDFS_I(inode);
 	struct rpdfs_inode *rinode = hnd->data;
@@ -317,43 +319,104 @@ out:
 	return inode;
 }
 
-/*
- * Prepare an inode for use in a transaction by adding its block to the
- * transaction.  As we hold the read reference on the block we can
- * update the vfs inode.  This is typically done at the start of
- * transactions so the rest of the transaction can work with the most
- * recent vfs inode fields.
- */
-int rpdfs_inode_txn_prepare(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
-			    struct inode *inode, rbaf_t rbaf)
-{
-	struct rpdfs_block_handle *hnd = NULL;
-	int ret;
+struct inode_hnd {
+	struct inode *inode;
+	struct rpdfs_block_handle **hnd;
+};
 
-	ret = rpdfs_txn_prepare_acquire(rfi, txn, rpdfs_inode_bnr(inode), &hnd);
-	if (ret == 0) {
-		rpdfs_inode_refresh(rfi, hnd, inode);
-		rpdfs_txn_prepare_release(rfi, txn, &hnd, rbaf);
+/* NULL inode goes to the end */
+static int cmp_inode_ino(const void *a, const void *b)
+{
+	const struct inode_hnd *ihnd_a = a;
+	const struct inode_hnd *ihnd_b = b;
+
+	return rpdfs_compare(ihnd_a->inode ? rpdfs_inode_ino(ihnd_a->inode) : U64_MAX,
+			     ihnd_b->inode ? rpdfs_inode_ino(ihnd_b->inode) : U64_MAX);
+}
+
+/*
+ * Acquire handles on the blocks for the given inodes in the appropriate
+ * order.  After acquiring each block handle make sure that the inode
+ * (and our private into) are current with the contents of the block.
+ * NULL inode arguments and their matching handle are ignored.
+ *
+ * On success all the non-null handles have been acquired and must be
+ * released by the caller.
+ */
+int rpdfs_inode_acquire_ordered(struct rpdfs_fs_info *rfi,
+				struct inode *a, struct rpdfs_block_handle **a_hnd,
+				struct inode *b, struct rpdfs_block_handle **b_hnd,
+				struct inode *c, struct rpdfs_block_handle **c_hnd,
+				struct inode *d, struct rpdfs_block_handle **d_hnd, rbaf_t rbaf)
+{
+	struct inode_hnd sorted[4] = {
+		{ a, a_hnd }, { b, b_hnd }, { c, c_hnd }, { d, d_hnd }
+	};
+	int ret;
+	int i;
+
+	sort(sorted, ARRAY_SIZE(sorted), sizeof(sorted[0]), cmp_inode_ino, NULL);
+
+	ret = 0;
+	for (i = 0; i < ARRAY_SIZE(sorted); i++) {
+		if (!sorted[i].inode)
+			break;
+
+		ret = rpdfs_block_acquire(rfi, rpdfs_inode_bnr(sorted[i].inode), sorted[i].hnd,
+					  rbaf);
+		if (ret < 0) {
+			while (i-- > 0)
+				rpdfs_block_release(rfi, sorted[i].hnd);
+			break;
+		}
+		rpdfs_inode_refresh(rfi, sorted[i].inode, *sorted[i].hnd);
 	}
 
 	return ret;
 }
 
 /*
- * Update a block that was prepared for writing in the transaction with
- * the current contents of the vfs inode.
+ * Acquire a handle on the block containing the inode.  Once acquired,
+ * make sure the inode matches the current contents of the block.
  */
-void rpdfs_inode_txn_update(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
-			    struct inode *inode)
+int rpdfs_inode_acquire(struct rpdfs_fs_info *rfi, struct inode *inode,
+			struct rpdfs_block_handle **hnd, rbaf_t rbaf)
 {
-	struct rpdfs_inode_info *ri = RPDFS_I(inode);
-	struct rpdfs_block_handle *hnd = NULL;
-	struct rpdfs_inode *rinode;
 	int ret;
 
-	ret = rpdfs_txn_use_prepared(rfi, txn, rpdfs_inode_bnr(inode), &hnd, RBAF_WRITE);
-	BUG_ON(ret < 0); /* caller must have prepared */
+	ret = rpdfs_block_acquire(rfi, rpdfs_inode_bnr(inode), hnd, rbaf);
+	if (ret == 0)
+		rpdfs_inode_refresh(rfi, inode, *hnd);
 
+	return ret;
+}
+
+/*
+ * The caller has modified the inode.  Update the block contents in the
+ * handle to match the inode (and our private info).
+ *
+ * It's often the case that callers must be careful to call when they're
+ * returning errors.  We have patterns where modifications can update a
+ * structure stored in a block that the path isn't aware of (btree
+ * roots) and not be able to dirty the block that contains the root.
+ * Callers must assume that the root was modified, even when errors are
+ * returned.  If we didn't do this then references and allocated block
+ * uses could get out of sync.
+ *
+ * It's safe to call this with a null/err handle so that it can be
+ * unconditionally called in exit paths regardless of whether the inode
+ * handle was acquired.
+ */
+void rpdfs_inode_update_dirty(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
+			      struct inode *inode, struct rpdfs_block_handle *hnd)
+{
+	struct rpdfs_inode_info *ri;
+	struct rpdfs_inode *rinode;
+
+	if (IS_ERR_OR_NULL(hnd))
+		return;
+
+	ri = RPDFS_I(inode);
 	rinode = hnd->data;
 	rpdfs_prd("ino %llu rw %llu hw %llu rm %llu vm %llu",
 		  rpdfs_inode_ino(inode), ri->refresh_wcount, hnd->wcount,
