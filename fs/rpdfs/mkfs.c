@@ -17,28 +17,14 @@ int rpdfs_mkfs(struct rpdfs_fs_info *rfi)
 {
 	struct rpdfs_block_handle *hnd = NULL;
 	struct rpdfs_inode *rinode;
-	DECLARE_RPDFS_TXN(txn);
 	u64 bnr;
 	int ret;
 
 	bnr = rpdfs_ino_bnr(RPDFS_ROOT_INO);
 
-	/*
-	 * This works today because txn block prep doesn't verify block
-	 * details, but once it checks read checksums this will fail and
-	 * we'll need a richer txn interface for preparing to write to
-	 * unused blocks.
-	 */
-	do {
-		ret = rpdfs_txn_prepare_acquire(rfi, &txn, bnr, &hnd);
-		if (ret == 0)
-			rpdfs_txn_prepare_release(rfi, &txn, &hnd, RBAF_WRITE | RBAF_OVERWRITE);
-	} while (rpdfs_txn_retry(rfi, &txn, &ret));
+	ret = rpdfs_block_acquire(rfi, bnr, &hnd, RBAF_WRITE | RBAF_OVERWRITE);
 	if (ret < 0)
 		goto out;
-
-	ret = rpdfs_txn_use_prepared(rfi, &txn, bnr, &hnd, RBAF_WRITE | RBAF_OVERWRITE);
-	BUG_ON(ret != 0);
 
 	memset(hnd->data, 0, RPDFS_BLOCK_SIZE);
 	rinode = hnd->data;
@@ -53,12 +39,10 @@ int rpdfs_mkfs(struct rpdfs_fs_info *rfi)
 	rinode->ctime_nsec = rinode->atime_nsec;
 	rinode->mtime_nsec = rinode->atime_nsec;
 	rinode->crtime_nsec = rinode->atime_nsec;
-	ret = 0;
 
+	rpdfs_block_dirty(rfi, 0, hnd);
+	rpdfs_block_release(rfi, &hnd);
+	ret = rpdfs_block_flush(rfi, bnr, true);
 out:
-	rpdfs_txn_reset(rfi, &txn);
-	if (ret == 0)
-		ret = rpdfs_block_flush(rfi, bnr, true);
-
 	return ret;
 }
