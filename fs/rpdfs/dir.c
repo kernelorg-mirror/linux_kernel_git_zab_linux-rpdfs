@@ -808,8 +808,8 @@ const struct inode_operations rpdfs_dir_iops = {
 	.mkdir		= rpdfs_mkdir,
 	.rename		= rpdfs_rename,
 	.setattr	= rpdfs_setattr,
-	.unlink 	= rpdfs_unlink,
-	.rmdir 		= rpdfs_rmdir,
+	.unlink		= rpdfs_unlink,
+	.rmdir		= rpdfs_rmdir,
 };
 
 const struct file_operations rpdfs_dir_fops = {
