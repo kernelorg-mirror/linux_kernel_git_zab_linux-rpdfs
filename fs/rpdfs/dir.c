@@ -6,6 +6,7 @@
 #include <linux/xxhash.h>
 
 #include "balloc.h"
+#include "block.h"
 #include "btree_txn.h"
 #include "compare.h"
 #include "dir.h"
@@ -81,6 +82,11 @@ static bool bad_dent_item(struct rpdfs_dirent *dent, u16 val_size)
 	       val_size < offsetof(struct rpdfs_dirent, name[dent->name_len]);
 }
 
+static u64 dent_place_hi(struct inode *dir)
+{
+	return rpdfs_place_hi(RPDFS_PLACE_DIRENT_BTREE, rpdfs_inode_ino(dir), 0);
+}
+
 static int match_dent_cb(struct rpdfs_fs_info *rfi, u64 key, void *val, u16 val_size, void *arg)
 {
 	struct dent_cb_args *da = arg;
@@ -131,8 +137,8 @@ static int insert_entry(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn
 		{ .iov_base = (void *)da->name, .iov_len = da->name_len },
 	};
 
-	return rpdfs_btree_insert(rfi, txn, &ri->dirents, da->key, insert_dent_cb, da,
-				  kv, ARRAY_SIZE(kv));
+	return rpdfs_btree_insert(rfi, txn, dent_place_hi(dir), &ri->dirents, da->key,
+				  insert_dent_cb, da, kv, ARRAY_SIZE(kv));
 }
 
 static int modify_dent_cb(struct rpdfs_fs_info *rfi, u64 key, void *val, u16 val_size, void *arg)
@@ -157,7 +163,8 @@ static int modify_entry(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn
 {
 	struct rpdfs_inode_info *ri = RPDFS_I(dir);
 
-	return rpdfs_btree_modify(rfi, txn, &ri->dirents, da->key, modify_dent_cb, da);
+	return rpdfs_btree_modify(rfi, txn, dent_place_hi(dir), &ri->dirents, da->key,
+				  modify_dent_cb, da);
 }
 
 static int delete_entry(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
@@ -165,7 +172,8 @@ static int delete_entry(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn
 {
 	struct rpdfs_inode_info *ri = RPDFS_I(dir);
 
-	return rpdfs_btree_delete(rfi, txn, &ri->dirents, da->key, match_dent_cb, da);
+	return rpdfs_btree_delete(rfi, txn, dent_place_hi(dir), &ri->dirents, da->key,
+				  match_dent_cb, da);
 }
 
 static struct dentry *rpdfs_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
@@ -243,6 +251,7 @@ static struct inode *create_new_inode(struct mnt_idmap *idmap, struct inode *dir
 	struct inode *inode = NULL;
 	struct rpdfs_ino_gen ig;
 	struct dent_cb_args da;
+	u64 ino;
 	int ret;
 
 	ret = rpdfs_inode_acquire(rfi, dir, &dir_hnd, RBAF_WRITE) ?:
@@ -250,8 +259,11 @@ static struct inode *create_new_inode(struct mnt_idmap *idmap, struct inode *dir
 	if (ret < 0)
 		goto out;
 
-	ig.ino = cpu_to_le64(inode_hnd->bnr);
+	ino = inode_hnd->bnr;
+	ig.ino = cpu_to_le64(ino);
 	ig.gen = cpu_to_le64(1);
+	rpdfs_block_set_place(inode_hnd, RPDFS_PLACE_INODE, ino, 0, 0);
+
 	inode = rpdfs_new_inode(sb, &ig);
 	if (IS_ERR(inode)) {
 		/* -EBUSY from the ino being hashed probably should be retried, not returned */

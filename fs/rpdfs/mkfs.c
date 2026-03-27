@@ -40,6 +40,7 @@ int rpdfs_mkfs(struct rpdfs_fs_info *rfi)
 	rinode->mtime_nsec = rinode->atime_nsec;
 	rinode->crtime_nsec = rinode->atime_nsec;
 
+	rpdfs_block_set_place(hnd, RPDFS_PLACE_INODE, RPDFS_ROOT_INO, 0, 0);
 	rpdfs_block_dirty(rfi, 0, hnd);
 	rpdfs_block_release(rfi, &hnd);
 	ret = rpdfs_block_flush(rfi, bnr, true);

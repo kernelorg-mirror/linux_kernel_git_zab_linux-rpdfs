@@ -53,6 +53,11 @@ static bool bad_xattr_item(struct rpdfs_xattr *xattr, u16 val_size)
 	       val_size < xattr_item_size(xattr->name_len, le16_to_cpu(xattr->val_len));
 }
 
+static u64 xattr_place_hi(struct inode *inode)
+{
+	return rpdfs_place_hi(RPDFS_PLACE_XATTR_BTREE, rpdfs_inode_ino(inode), 0);
+}
+
 static int match_xattr_cb(struct rpdfs_fs_info *rfi, u64 key, void *val, u16 val_size, void *arg)
 {
 	struct xattr_cb_args *xa = arg;
@@ -124,7 +129,8 @@ static int insert_xattr(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn
 		nr_segs++;
 	}
 
-	return rpdfs_btree_insert(rfi, txn, &ri->xattrs, xa->key, nil_xattr_cb, xa, kv, nr_segs);
+	return rpdfs_btree_insert(rfi, txn, xattr_place_hi(inode), &ri->xattrs, xa->key,
+				  nil_xattr_cb, xa, kv, nr_segs);
 }
 
 static int delete_xattr_cb(struct rpdfs_fs_info *rfi, u64 key, void *val, u16 val_size, void *arg)
@@ -148,7 +154,8 @@ static int delete_xattr(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn
 	struct rpdfs_inode_info *ri = RPDFS_I(inode);
 
 	xa->del_key = del_key;
-	return rpdfs_btree_delete(rfi, txn, &ri->xattrs, xa->key, delete_xattr_cb, xa);
+	return rpdfs_btree_delete(rfi, txn, xattr_place_hi(inode), &ri->xattrs, xa->key,
+				  delete_xattr_cb, xa);
 }
 
 static int rpdfs_xattr_get(struct inode *inode, const char *name, void *value, size_t size)
