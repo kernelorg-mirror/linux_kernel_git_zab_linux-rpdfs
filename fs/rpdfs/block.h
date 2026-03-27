@@ -5,6 +5,7 @@
 #include <linux/list.h>
 
 #include "block.h"
+#include "place.h"
 #include "super.h"
 
 typedef u8 __bitwise rbaf_t;
@@ -75,11 +76,18 @@ enum {
  * these pointers.  The block properties here are read-only.
  */
 struct rpdfs_block_handle {
+	u128 place;
 	u64 bnr;
 	u64 alloc_ctr;
 	u64 wcount;
 	void *data;
 };
+
+static inline void rpdfs_block_set_place(struct rpdfs_block_handle *hnd, u8 type, u64 ino,
+					 u8 depth, u64 off)
+{
+	hnd->place = rpdfs_place_full(type, ino, depth, off);
+}
 
 int rpdfs_block_acquire(struct rpdfs_fs_info *rfi, u64 bnr, struct rpdfs_block_handle **hnd_ret,
 			rbaf_t rbaf);

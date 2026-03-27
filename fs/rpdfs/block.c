@@ -15,6 +15,7 @@
 #include "lists.h"
 #include "map.h"
 #include "net.h"
+#include "place.h"
 #include "pr.h"
 #include "rht.h"
 #include "seqlock.h"
@@ -182,12 +183,14 @@ enum {
 
 #define bitfield_char(f, c) ((f) ? c : '-')
 #define RBF \
-	"bnr %llu ac %llu wc %llu refc %llx rd %lu %c%c%c%c rm %u gm %u cm %u wcm %u"
+	"bnr %llu ac %llu wc %llu plc "RPF" refc %llx rd %lu %c%c%c%c " \
+	"rm %u gm %u cm %u wcm %u"
 #define RBA(bk) \
-	(bk)->hnd.bnr, (bk)->hnd.alloc_ctr, (bk)->hnd.wcount, atomic64_read(&(bk)->refcount), \
-	(bk)->readers, bitfield_char(bk->dirty, 'd'), bitfield_char(bk->upd_meta,  'M'), \
-	bitfield_char(bk->upd_data, 'D'), bitfield_char(bk->writer,  'w'), \
-	(bk)->request_mode, (bk)->grant_mode, (bk)->confirm_mode, (bk)->write_confirm_mode
+	(bk)->hnd.bnr, (bk)->hnd.alloc_ctr, (bk)->hnd.wcount, RPA((bk)->hnd.place), \
+	atomic64_read(&(bk)->refcount), (bk)->readers, bitfield_char(bk->dirty, 'd'), \
+	bitfield_char(bk->upd_meta,  'M'), bitfield_char(bk->upd_data, 'D'), \
+	bitfield_char(bk->writer,  'w'), (bk)->request_mode, (bk)->grant_mode, \
+	(bk)->confirm_mode, (bk)->write_confirm_mode
 
 static const struct rhashtable_params block_ht_params = {
 	.key_len	= sizeof_field(struct rpdfs_block, hnd.bnr),
@@ -591,8 +594,7 @@ static int send_block_read(struct rpdfs_fs_info *rfi, u64 bnr, u8 mode, bool wit
 	return ret;
 }
 
-static int send_block_write(struct rpdfs_fs_info *rfi, u64 bnr, u64 alloc_ctr, u64 wcount,
-			    u8 mode, struct page *data_page, gfp_t gfp)
+static int send_block_write(struct rpdfs_fs_info *rfi, struct rpdfs_block *bk, u8 mode, gfp_t gfp)
 {
 	struct rpdfs_net_transport_addr addr;
 	struct rpdfs_msg_block_write wr;
@@ -600,19 +602,20 @@ static int send_block_write(struct rpdfs_fs_info *rfi, u64 bnr, u64 alloc_ctr, u
 		.type = RPDFS_MSG_BLOCK_WRITE,
 		.ctl_buf = &wr,
 		.ctl_size = sizeof(wr),
-		.data_page = data_page,
-		.data_size = data_page ? RPDFS_BLOCK_SIZE : 0,
+		.data_page = bk->data_page,
+		.data_size = bk->data_page ? RPDFS_BLOCK_SIZE : 0,
 	};
 	u64 mver;
 	int ret;
 
-	wr.bnr = cpu_to_le64(bnr);
-	wr.alloc_ctr = cpu_to_le64(alloc_ctr);
-	wr.wcount = cpu_to_le64(wcount);
+	wr.bnr = cpu_to_le64(bk->hnd.bnr);
+	wr.det.alloc_ctr = cpu_to_le64(bk->hnd.alloc_ctr);
+	wr.det.wcount = cpu_to_le64(bk->hnd.wcount);
+	rpdfs_place_split_le(&wr.det.place_lo, &wr.det.place_hi, bk->hnd.place);
 	wr.confirm_mode = mode;
 	memzero_explicit(&wr._pad, sizeof(wr._pad));
 
-	ret = rpdfs_map_bnr_to_addr(rfi, bnr, &addr, &mver);
+	ret = rpdfs_map_bnr_to_addr(rfi, bk->hnd.bnr, &addr, &mver);
 	if (ret == 0)
 		ret = rpdfs_net_send(rfi, &addr, &md, gfp);
 	BUG_ON(ret < 0);
@@ -933,8 +936,7 @@ static void rpdfs_block_write_work_fn(struct work_struct *work)
 		}
 		write_sequnlock(&bk->seqlock);
 
-		ret = send_block_write(rfi, bk->hnd.bnr, bk->hnd.alloc_ctr, bk->hnd.wcount,
-				       mode, bk->data_page, GFP_NOFS);
+		ret = send_block_write(rfi, bk, mode, GFP_NOFS);
 		BUG_ON(ret < 0);
 	}
 
@@ -1496,8 +1498,9 @@ static int recv_block_read_result(struct rpdfs_fs_info *rfi, struct rpdfs_net_me
 	if (rr->grant_mode && rr->grant_mode < bk->grant_mode) {
 		ret = -EPROTO;
 	} else {
-		bk->hnd.alloc_ctr = le64_to_cpu(rr->alloc_ctr);
-		bk->hnd.wcount = le64_to_cpu(rr->wcount);
+		bk->hnd.place = rpdfs_place_combine_le(rr->det.place_lo, rr->det.place_hi);
+		bk->hnd.alloc_ctr = le64_to_cpu(rr->det.alloc_ctr);
+		bk->hnd.wcount = le64_to_cpu(rr->det.wcount);
 		bk->upd_meta = 1;
 
 		if (md->data_page) {

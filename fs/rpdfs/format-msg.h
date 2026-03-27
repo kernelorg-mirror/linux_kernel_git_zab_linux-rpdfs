@@ -4,6 +4,8 @@
 
 #include <linux/math.h>
 
+#include "format-block.h"
+
 enum {
 	RPDFS_MSG_BLOCK_READ = 0,
 	RPDFS_MSG_BLOCK_READ_RESULT,
@@ -63,10 +65,41 @@ struct rpdfs_msg_block_read {
 
 #define RPDFS_MSG_BLOCK_READ_FLAG_DATA	(1 << 0)
 
-struct rpdfs_msg_block_read_result {
-	__le64 bnr;
+/*
+ * A block's place is a 128bit value that uniquely identifies the
+ * logical location of the block in the global fs block space.  The
+ * value is designed so that regular forward block traversal sees
+ * increasing place values.  (f.e.: inode block < data mapping blocks <
+ * data blocks).
+ *
+ * Over the wire the place is communicated as 2 64bit values and these
+ * shifts and masks encode the first three fields into the hi word.
+ */
+#define RPDFS_PLACE_DEPTH_BITS	4
+#define RPDFS_PLACE_INO_BITS	(64 - RPDFS_BLOCK_SHIFT)
+#define RPDFS_PLACE_TYPE_BITS	4
+
+#define RPDFS_PLACE_INO_SHIFT	RPDFS_PLACE_DEPTH_BITS
+#define RPDFS_PLACE_TYPE_SHIFT	(RPDFS_PLACE_INO_SHIFT + RPDFS_PLACE_INO_BITS)
+
+#define RPDFS_PLACE_DEPTH_MASK	((1ULL << RPDFS_PLACE_DEPTH_BITS) - 1)
+#define RPDFS_PLACE_INO_MASK	((1ULL << RPDFS_PLACE_INO_BITS) - 1)
+#define RPDFS_PLACE_TYPE_MASK	((1ULL << RPDFS_PLACE_TYPE_BITS) - 1)
+
+#define RPDFS_PLACE_INODE		4
+#define RPDFS_PLACE_XATTR_BTREE		8
+#define RPDFS_PLACE_DIRENT_BTREE	12
+
+struct rpdfs_msg_block_details {
 	__le64 alloc_ctr;
 	__le64 wcount;
+	__le64 place_lo;
+	__le64 place_hi;
+};
+
+struct rpdfs_msg_block_read_result {
+	__le64 bnr;
+	struct rpdfs_msg_block_details det;
 	__u8 grant_mode;
 	__u8 err;
 	__u8 _pad[6];
@@ -74,8 +107,7 @@ struct rpdfs_msg_block_read_result {
 
 struct rpdfs_msg_block_write {
 	__le64 bnr;
-	__le64 alloc_ctr;
-	__le64 wcount;
+	struct rpdfs_msg_block_details det;
 	__u8 confirm_mode;
 	__u8 _pad[7];
 };
