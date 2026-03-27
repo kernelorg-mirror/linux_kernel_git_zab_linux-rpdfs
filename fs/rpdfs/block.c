@@ -5,6 +5,7 @@
 #include <linux/mm.h>
 #include <linux/wait.h>
 #include <linux/rhashtable.h>
+#include <linux/list_sort.h>
 
 #include "balloc.h"
 #include "block.h"
@@ -955,11 +956,101 @@ static struct rpdfs_block *first_within_boundary(struct list_head *list,
 }
 
 /*
+ * Walk the clear list and set write on each block as long as they're
+ * sorted by place.
+ *
+ * If we hit a block in the clear list that isn't sorted by place then
+ * we unwind all the blocks in the set list greater than the out of
+ * order block.  The caller will sort the clear list and try again.
+ *
+ * As we set write we also see if we need to extend the boundary to
+ * cover more dependent blocks.  As the caller retries they also check
+ * their boundary against the dirty list.
+ */
+static bool set_write_in_order(struct list_head *set_list, struct list_head *clear_list,
+			       struct rpdfs_dist_write *wri, struct rpdfs_dirty_boundary *bnd)
+{
+	struct rpdfs_block *bk;
+	struct rpdfs_block *_bk_;
+	bool ordered = true;
+	bool extended = false;
+	bool writer;
+	u128 place;
+
+	if (!list_empty(set_list)) {
+		bk = list_last_entry(set_list, struct rpdfs_block, dirty_head);
+		place = bk->hnd.place;
+	} else {
+		place = 0;
+	}
+
+	list_for_each_entry_safe(bk, _bk_, clear_list, dirty_head) {
+		do {
+			write_seqlock(&bk->seqlock);
+			/* would be.. corruption error? but we don't have io errors wired up */
+			BUG_ON(bk->hnd.place == place);
+			ordered = bk->hnd.place > place;
+			writer = bk->writer;
+			if (ordered && !writer) {
+				bk->wri = wri;
+				extended |= extend_boundary(bnd, &bk->dirty_bnd);
+				list_move_tail(&bk->dirty_head, set_list);
+			}
+			/* save for unwinding or for continuing ordered test */
+			if (!ordered || !writer)
+				place = bk->hnd.place;
+			write_sequnlock(&bk->seqlock);
+			if (ordered && writer)
+				wait_event(bk->waitq, !block_has_writer(bk));
+		} while (ordered && writer);
+		if (!ordered)
+			break;
+	}
+
+	if (!ordered) {
+		list_for_each_entry_safe_reverse(bk, _bk_, set_list, dirty_head) {
+			if (bk->hnd.place < place)
+				break;
+			write_seqlock(&bk->seqlock);
+			bk->wri = NULL;
+			list_move(&bk->dirty_head, clear_list);
+			write_sequnlock(&bk->seqlock);
+			wake_up_all(&bk->waitq);
+		}
+	}
+
+	return extended || !ordered;
+}
+
+static int cmp_dirty_head_place(void *priv, const struct list_head *A, const struct list_head *B)
+{
+	const struct rpdfs_block *a = container_of(A, struct rpdfs_block, dirty_head);
+	const struct rpdfs_block *b = container_of(B, struct rpdfs_block, dirty_head);
+
+	/* see list_sort comment for 0/1 cmp return */
+	return a->hnd.place > b->hnd.place;
+}
+
+/*
  * The flush work is responsible for gathering blocks in the dirty lists
- * into distributed writes.  This is racing with writers acquiring
- * handles on the blocks.  It advances the requested boundary as it
- * works, which prevents writers from acquiring dirty blocks within the
- * boundary.
+ * into distributed writes.  The distributed writes must cover all the
+ * blocks that were modified together in transactions.
+ *
+ * A boundary is maintained which defines the blocks that will be
+ * included from the dirty lists.  As we get each block we see if its
+ * dirty boundary should extend the flushing boundary.
+ *
+ * As we try and set the write pointer in the block, we'll wait for any
+ * write acquisitions to finish.  We're racing with writers who will
+ * block waiting for the write pointer to clear.  We need to set the
+ * write pointer in place order to avoid deadlocking.  We sort blocks by
+ * their place before trying to set the write pointer.  The blocks may
+ * be actively being dirtied and can have their place changed before we
+ * get to them.  We might have to re-sort and retry.
+ *
+ * Dirty blocks have an elevated refcount.  It's only dropped once we
+ * send the blocks to writers for IO and cleaning.  We can operate on
+ * all dirty blocks using this reference.
  */
 static void rpdfs_block_flush_work_fn(struct work_struct *work)
 {
@@ -968,7 +1059,8 @@ static void rpdfs_block_flush_work_fn(struct work_struct *work)
 	struct rpdfs_dirty_list *dlist;
 	struct rpdfs_dist_write *wri;
 	struct rpdfs_block *bk;
-	bool extended;
+	LIST_HEAD(clear_list);
+	bool retry;
 	bool flush;
 	int i;
 
@@ -986,21 +1078,12 @@ static void rpdfs_block_flush_work_fn(struct work_struct *work)
 	if (!flush)
 		return;
 
-	/* gather dirty blocks up to the boundary from the dirty lists */
-	extended = false;
 	do {
-		/* announce to writers that they should wait for dirty blocks within requested */
-		if (extended) {
-			write_seqlock(&flshr->seqlock);
-			extend_boundary(&flshr->requested_bnd, &wri->bnd);
-			write_sequnlock(&flshr->seqlock);
-			extended = false;
-		}
 
 		for (i = 0; i < NR_DIRTY_LISTS; i++) {
 			dlist = get_dlist(binf, i);
 
-			/* gather blocks from dirty lists within the boundary */
+			/* move blocks from global to private dirty list when within boundary */
 			while_read_seqretry(&dlist->seqlock)
 				bk = first_within_boundary(&dlist->list, &wri->bnd, i);
 			if (bk) {
@@ -1011,22 +1094,21 @@ static void rpdfs_block_flush_work_fn(struct work_struct *work)
 				write_sequnlock(&dlist->seqlock);
 			}
 
-			/* add blocks to the write, possibly extending boundary */
+			/* get blocks within boundary for the write */
 			while ((bk = first_within_boundary(&flshr->dirty_list[i], &wri->bnd, i))) {
-
-				/* wait for writers to drain and block on flush boundary */
-				wait_event(bk->waitq, !block_has_writer(bk));
-
 				write_seqlock(&bk->seqlock);
-				bk->wri = wri;
-				list_move_tail(&bk->dirty_head, &wri->dirty_list);
+				list_move_tail(&bk->dirty_head, &clear_list);
 				write_sequnlock(&bk->seqlock);
-
-				extended |= extend_boundary(&wri->bnd, &bk->dirty_bnd);
 				wri->nr_blocks++;
 			}
 		}
-	} while (extended);
+
+		/* sort the blocks we're about to set by place, might still change */
+		list_sort(NULL, &clear_list, cmp_dirty_head_place);
+
+		/* set write in place order, maybe retry to sort or get more blocks */
+		retry = set_write_in_order(&wri->dirty_list, &clear_list, wri, &wri->bnd);
+	} while (retry);
 
 	write_seqlock(&flshr->seqlock);
 	extend_boundary(&flshr->writing_bnd, &wri->bnd);
@@ -1076,24 +1158,6 @@ static void queue_block_flush(struct rpdfs_block_info *binf, struct rpdfs_block 
 }
 
 /*
- * Returns true if the block is dirty and its seq is within the
- * requested boundary that is being flushed.  This is the only place
- * that uses both the bk and flshr seqlock.
- */
-static bool dirty_within_flush(struct rpdfs_block_info *binf, struct rpdfs_block *bk)
-{
-	struct rpdfs_flusher *flshr = binf->flshr;
-	bool within = false;
-
-	if (bk->dirty) {
-		while_read_seqretry(&flshr->seqlock)
-			within = bk->dirty_seq <= flshr->requested_bnd.seq[bk->dirty_list_nr];
-	}
-
-	return within;
-}
-
-/*
  * Returns true as the wait condition for the sleeping acquire caller if
  * it should retry the acquire.  This must match all the conditions in
  * the _acquire loop that do anything other than block.  There are some
@@ -1112,7 +1176,7 @@ static bool should_try_acquire(struct rpdfs_block_info *binf, struct rpdfs_block
 		       (mode > bk->request_mode)) ||
 		      ((mode <= bk->grant_mode) &&
 		       (!bk->confirm_mode || mode <= bk->confirm_mode) &&
-		       (!(rbaf & RBAF_WRITE) || !dirty_within_flush(binf, bk)) &&
+		       (!(rbaf & RBAF_WRITE) || bk->wri == NULL) &&
 		       modes_compatible(readers_writer_mode(bk), mode));
 	}
 
@@ -1176,7 +1240,6 @@ int rpdfs_block_acquire(struct rpdfs_fs_info *rfi, u64 bnr, struct rpdfs_block_h
 			   !(bk->grant_mode == RPDFS_CACHE_MODE_WRITE &&
 			     bk->confirm_mode == RPDFS_CACHE_MODE_NULL &&
 			     readers_writer_mode(bk) == RPDFS_CACHE_MODE_NONE &&
-			     !dirty_within_flush(binf, bk) &&
 			     alloc_ctr_is_free(bk->hnd.alloc_ctr))) {
 			/* only satisfy allocs from idle write mode free blocks */
 			ret = -ENODATA;
@@ -1206,8 +1269,8 @@ int rpdfs_block_acquire(struct rpdfs_fs_info *rfi, u64 bnr, struct rpdfs_block_h
 				}
 			}
 
-		} else if ((rbaf & RBAF_WRITE) && dirty_within_flush(binf, bk)) {
-			/* requested flush of this block blocks writer */
+		} else if ((rbaf & RBAF_WRITE) && bk->wri) {
+			/* write acquisition waits for writeback to finish */
 			if (rbaf & RBAF_NONBLOCK_FLUSH)
 				ret = -EAGAIN;
 
