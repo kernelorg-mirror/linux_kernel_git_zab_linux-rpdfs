@@ -1352,6 +1352,29 @@ void rpdfs_block_dirty(struct rpdfs_fs_info *rfi, u64 other_bnr, struct rpdfs_bl
 	}
 }
 
+/*
+ * Return true if the block is cached and dirty at the moment.  This is
+ * inherently racy and the caller must be prepared for the block to no
+ * longer be dirty even before this returns.
+ */
+bool rpdfs_block_is_dirty(struct rpdfs_fs_info *rfi, u64 bnr)
+{
+	struct rpdfs_block_info *binf = RPDFS_BINF(rfi);
+	struct rpdfs_block *bk;
+	bool dirty;
+
+	bk = lookup_block(binf, bnr);
+	if (bk) {
+		while_read_seqretry(&bk->seqlock)
+			dirty = bk->dirty;
+		put_block(bk);
+	} else {
+		dirty = false;
+	}
+
+	return dirty;
+}
+
 static bool flushed_within(struct rpdfs_block_info *binf, struct rpdfs_dirty_boundary *bnd)
 {
 	struct rpdfs_flusher *flshr = binf->flshr;

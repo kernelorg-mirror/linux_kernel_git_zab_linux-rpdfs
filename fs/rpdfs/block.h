@@ -94,6 +94,7 @@ int rpdfs_block_acquire(struct rpdfs_fs_info *rfi, u64 bnr, struct rpdfs_block_h
 void rpdfs_block_release(struct rpdfs_fs_info *rfi, struct rpdfs_block_handle **hnd);
 
 void rpdfs_block_dirty(struct rpdfs_fs_info *rfi, u64 other_bnr, struct rpdfs_block_handle *hnd);
+bool rpdfs_block_is_dirty(struct rpdfs_fs_info *rfi, u64 bnr);
 int rpdfs_block_flush(struct rpdfs_fs_info *rfi, u64 bnr, bool wait);
 int rpdfs_block_sync(struct rpdfs_fs_info *rfi, bool wait);
 
