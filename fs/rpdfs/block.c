@@ -1158,29 +1158,84 @@ static void queue_block_flush(struct rpdfs_block_info *binf, struct rpdfs_block 
 }
 
 /*
- * Returns true as the wait condition for the sleeping acquire caller if
- * it should retry the acquire.  This must match all the conditions in
- * the _acquire loop that do anything other than block.  There are some
- * cases (like returning when _NONBLOCK_) that don't need to be tested
- * here because they would have returned instead of blocking and calling
- * this.
+ * See if the caller can acquire the block with their mode and flags.
+ * This is primarily called under a write seqlock when the caller will
+ * act on the return.  It's also called during a read seqlock retry as a
+ * wait condition to see if we should wake up and try again under the
+ * write seqlock.
+ *
+ * Returns:
+ *          < 0: hard error that should be returned without acquiring
+ *            0: keep waiting as long as this returns zero
+ *     CAN_SEND: send a request for the mode and then wait
+ *  CAN_ACQUIRE: success, increment counts and return handle
  */
-static bool should_try_acquire(struct rpdfs_block_info *binf, struct rpdfs_block *bk,
-			       u8 mode, rbaf_t rbaf)
+#define CAN_SEND      1
+#define CAN_ACQUIRE   2
+static int can_acquire(struct rpdfs_block_info *binf, struct rpdfs_block *bk, u8 mode, rbaf_t rbaf)
 {
-	bool try;
+	int ret;
 
-	while_read_seqretry(&bk->seqlock) {
-		try = (bk->error && !(rbaf & RBAF_OVERWRITE)) ||
-		      (((mode > bk->grant_mode) || (mode > bk->confirm_mode)) &&
-		       (mode > bk->request_mode)) ||
-		      ((mode <= bk->grant_mode) &&
-		       (!bk->confirm_mode || mode <= bk->confirm_mode) &&
-		       (!(rbaf & RBAF_WRITE) || bk->wri == NULL) &&
-		       modes_compatible(readers_writer_mode(bk), mode));
+	/* return a read error */
+	if (bk->error && !(rbaf & RBAF_OVERWRITE)) {
+		ret = bk->error;
+		goto out;
 	}
 
-	return try;
+	/* only satisfy allocs from idle write mode free blocks */
+	if ((rbaf & RBAF_ALLOC) &&
+	    !(bk->grant_mode == RPDFS_CACHE_MODE_WRITE &&
+	      bk->confirm_mode == RPDFS_CACHE_MODE_NULL &&
+	      readers_writer_mode(bk) == RPDFS_CACHE_MODE_NONE &&
+	      alloc_ctr_is_free(bk->hnd.alloc_ctr))) {
+		ret = -ENODATA;
+		goto out;
+	}
+
+	if ((rbaf & RBAF_ALREADY_DIRTY) && !bk->dirty) {
+		ret = -ENODATA;
+		goto out;
+	}
+
+	/* don't have sufficient mode */
+	if ((mode > bk->grant_mode) || (bk->confirm_mode && mode > bk->confirm_mode)) {
+		if (rbaf & RBAF_NONBLOCK_MODE)
+			ret = -EAGAIN;
+		else if (mode > bk->request_mode)
+			ret = CAN_SEND;
+		else
+			ret = 0;
+		goto out;
+	}
+
+	/* write acquisition waits for writeback to finish */
+	if ((rbaf & RBAF_WRITE) && bk->wri) {
+		if (rbaf & RBAF_NONBLOCK_FLUSH)
+			ret = -EAGAIN;
+		else
+			ret = 0;
+		goto out;
+	}
+
+	/* finally acquire if we're compatible with others, or wait for incompat to finish */
+	if (modes_compatible(readers_writer_mode(bk), mode))
+		ret = CAN_ACQUIRE;
+	else
+		ret = 0;
+out:
+	BUG_ON(ret > CAN_ACQUIRE);
+	return ret;
+}
+
+static bool retry_acquire(struct rpdfs_block_info *binf, struct rpdfs_block *bk, u8 mode,
+			  rbaf_t rbaf)
+{
+	bool retry;
+
+	while_read_seqretry(&bk->seqlock)
+		retry = can_acquire(binf, bk, mode, rbaf) != 0;
+
+	return retry;
 }
 
 /*
@@ -1231,78 +1286,52 @@ int rpdfs_block_acquire(struct rpdfs_fs_info *rfi, u64 bnr, struct rpdfs_block_h
 
 		write_seqlock(&bk->seqlock);
 
-		ret = 0;
-		if (bk->error && !(rbaf & RBAF_OVERWRITE)) {
-			/* return a read error */
-			ret = bk->error;
-
-		} else if ((rbaf & RBAF_ALLOC) &&
-			   !(bk->grant_mode == RPDFS_CACHE_MODE_WRITE &&
-			     bk->confirm_mode == RPDFS_CACHE_MODE_NULL &&
-			     readers_writer_mode(bk) == RPDFS_CACHE_MODE_NONE &&
-			     alloc_ctr_is_free(bk->hnd.alloc_ctr))) {
-			/* only satisfy allocs from idle write mode free blocks */
-			ret = -ENODATA;
-
-		} else if ((rbaf & RBAF_ALREADY_DIRTY) && !bk->dirty) {
-			ret = -ENODATA;
-
-		} else if ((mode > bk->grant_mode) || (
-			    bk->confirm_mode && mode > bk->confirm_mode)) {
-			/* don't have sufficient mode */
-			if (rbaf & RBAF_NONBLOCK_MODE) {
-				ret = -EAGAIN;
-
-			} else if (mode > bk->request_mode) {
-				/* request elevated mode, either read or bare request */
-				if (!bk->upd_meta || (!bk->upd_data && need_data))
-					ret = send_block_read(rfi, bk->hnd.bnr, mode, need_data,
-							      GFP_NOWAIT);
-				else
-					ret = send_block_cache_mode(rfi, bk->hnd.bnr,
-								    RPDFS_MSG_BLOCK_REQUEST_MODE,
-								    mode, GFP_NOWAIT);
-				if (ret == 0) {
-					if (!bk->request_mode)
-						get_block(bk);
-					bk->request_mode = mode;
-				}
+		ret = can_acquire(binf, bk, mode, rbaf);
+		if (ret == CAN_SEND) {
+			/* ret turns into err or 0 to wait after successful send */
+			if (!bk->upd_meta || (!bk->upd_data && need_data))
+				ret = send_block_read(rfi, bk->hnd.bnr, mode, need_data,
+						      GFP_NOWAIT);
+			else
+				ret = send_block_cache_mode(rfi, bk->hnd.bnr,
+							    RPDFS_MSG_BLOCK_REQUEST_MODE,
+							    mode, GFP_NOWAIT);
+			if (ret == 0) {
+				if (!bk->request_mode)
+					get_block(bk);
+				bk->request_mode = mode;
 			}
-
-		} else if ((rbaf & RBAF_WRITE) && bk->wri) {
-			/* write acquisition waits for writeback to finish */
-			if (rbaf & RBAF_NONBLOCK_FLUSH)
-				ret = -EAGAIN;
-
-		} else if (modes_compatible(readers_writer_mode(bk), mode)) {
-			/* rbaf mode compatible with other handles, acquire */
+		} else if (ret == CAN_ACQUIRE) {
 			if (rbaf & RBAF_WRITE)
 				bk->writer = 1;
 			else
 				bk->readers++;
-
 			if (rbaf & RBAF_OVERWRITE)
 				bk->error = 0;
-
 			*hnd_ret = &bk->hnd;
 		}
+
 		write_sequnlock(&bk->seqlock);
 
 		rpdfs_net_preload_end(rfi);
 
-		if (*hnd_ret != NULL || ret < 0)
-			goto out;
+		if (ret == CAN_ACQUIRE) {
+			ret = 0;
+			break;
+		}
 
-		rpdfs_prd_rfi(rfi, "acquire mode %u rbaf %x wait "RBF,
-			      mode, rbaf, RBA(bk));
-
-		ret = wait_event_interruptible(bk->waitq, should_try_acquire(binf, bk, mode, rbaf));
+		if (ret == 0) {
+			rpdfs_prd_rfi(rfi, "waiting mode %u rbaf %x "RBF, mode, rbaf, RBA(bk));
+			ret = wait_event_interruptible(bk->waitq,
+						       retry_acquire(binf, bk, mode, rbaf));
+		}
 		if (ret < 0)
-			goto out;
+			break;
 	}
 out:
 	if (ret < 0)
 		put_block(bk);
+	rpdfs_prd_rfi(rfi, "bnr %llu rbaf %x ret %d", bnr, rbaf, ret);
 	return ret;
 }
 
