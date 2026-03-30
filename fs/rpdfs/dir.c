@@ -305,7 +305,7 @@ out:
 			iget_failed(inode);
 		inode = ERR_PTR(ret);
 		if (inode_hnd)
-			rpdfs_balloc_free_meta(rfi, &txn, inode_hnd->bnr);
+			rpdfs_txn_free_block(rfi, &txn, inode_hnd);
 	}
 
 	rpdfs_block_release(rfi, &dir_hnd);

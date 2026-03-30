@@ -95,13 +95,13 @@ static int split_block(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
 
 	ret = 0;
 out:
-	rpdfs_block_release(rfi, &par_hnd);
-	rpdfs_block_release(rfi, &sib_hnd);
 	if (ret < 0) {
 		rpdfs_block_release(rfi, hnd);
 		if (free_parent)
-			rpdfs_balloc_free_meta(rfi, txn, le64_to_cpu(par_ref->bnr));
+			rpdfs_txn_free_block(rfi, txn, par_hnd);
 	}
+	rpdfs_block_release(rfi, &par_hnd);
+	rpdfs_block_release(rfi, &sib_hnd);
 
 	return ret;
 }
@@ -196,9 +196,9 @@ static int merge_block(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
 
 	/* sib and parent might have been emptied */
 	if (sib->nr_items == 0) {
-		rpdfs_balloc_free_meta(rfi, txn, sib_hnd->bnr);
+		rpdfs_txn_free_block(rfi, txn, sib_hnd);
 		if (parent->nr_items == 0)
-			rpdfs_balloc_free_meta(rfi, txn, par_hnd->bnr);
+			rpdfs_txn_free_block(rfi, txn, par_hnd);
 	}
 
 	rpdfs_txn_block_dirty(rfi, txn, par_hnd);
@@ -378,7 +378,7 @@ int rpdfs_btree_delete(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
 		if (ret >= 0) {
 			rpdfs_txn_block_dirty(rfi, txn, hnd);
 			if (bt->nr_items == 0)
-				rpdfs_balloc_free_meta(rfi, txn, hnd->bnr);
+				rpdfs_txn_free_block(rfi, txn, hnd);
 		}
 		rpdfs_block_release(rfi, &hnd);
 	}

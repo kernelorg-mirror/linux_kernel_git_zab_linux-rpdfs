@@ -18,6 +18,8 @@ void rpdfs_txn_block_dirty(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *
 			   struct rpdfs_block_handle *hnd);
 int rpdfs_txn_acquire_alloc(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
 			    struct rpdfs_block_handle **hnd_ret);
+void rpdfs_txn_free_block(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
+			  struct rpdfs_block_handle *hnd);
 void rpdfs_txn_finish(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn);
 
 #endif

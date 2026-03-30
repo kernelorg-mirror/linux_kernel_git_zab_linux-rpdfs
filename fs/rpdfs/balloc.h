@@ -36,8 +36,6 @@ int rpdfs_balloc_alloc_bnr(struct rpdfs_balloc_region *reg, u64 *bnr_ret);
 struct rpdfs_balloc_region *rpdfs_balloc_take_region(struct rpdfs_fs_info *rfi);
 void rpdfs_balloc_return_region(struct rpdfs_fs_info *rfi, struct rpdfs_balloc_region *reg);
 
-int rpdfs_balloc_free_meta(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn, u64 bnr);
-
 int rpdfs_balloc_setup(struct rpdfs_fs_info *rfi);
 void rpdfs_balloc_destroy(struct rpdfs_fs_info *rfi);
 

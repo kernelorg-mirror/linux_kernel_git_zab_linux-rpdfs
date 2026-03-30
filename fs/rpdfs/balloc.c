@@ -238,11 +238,6 @@ void rpdfs_balloc_return_region(struct rpdfs_fs_info *rfi, struct rpdfs_balloc_r
 	}
 }
 
-int rpdfs_balloc_free_meta(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn, u64 bnr)
-{
-	return 0;
-}
-
 int rpdfs_balloc_setup(struct rpdfs_fs_info *rfi)
 {
 	struct rpdfs_balloc_info *balinf;

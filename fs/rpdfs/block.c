@@ -811,7 +811,9 @@ static unsigned long make_dirty(struct rpdfs_block_info *binf, struct rpdfs_bloc
 		write_seqcount_begin_nested(&dlist->seqlock.seqcount, SINGLE_DEPTH_NESTING);
 
 		bk->dirty = 1;
-		if (alloc_ctr_is_free(bk->hnd.alloc_ctr))
+		/* advance alloc_ctr to match pre-dirty place updates on alloc/free */
+		if (!(rpdfs_place_type(bk->hnd.place) == RPDFS_PLACE_FREE) !=
+		    !alloc_ctr_is_free(bk->hnd.alloc_ctr))
 			bk->hnd.alloc_ctr++;
 		bk->hnd.wcount++;
 		bk->dirty_seq = ++dlist->dirty_seq;
@@ -1870,6 +1872,7 @@ static int recv_free_stripe_grant(struct rpdfs_fs_info *rfi, struct rpdfs_net_me
 		write_seqlock(&bk->seqlock);
 		bk->hnd.alloc_ctr = le64_to_cpu(fsd[i].alloc_ctr);
 		bk->hnd.wcount = le64_to_cpu(fsd[i].wcount);
+		rpdfs_block_set_place(&bk->hnd, RPDFS_PLACE_FREE, 0, 0, bk->hnd.bnr);
 		bk->upd_meta = 1;
 		bk->grant_mode = RPDFS_CACHE_MODE_WRITE;
 		write_sequnlock(&bk->seqlock);

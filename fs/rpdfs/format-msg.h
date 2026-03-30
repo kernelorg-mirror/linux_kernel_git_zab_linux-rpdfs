@@ -89,6 +89,8 @@ struct rpdfs_msg_block_read {
 #define RPDFS_PLACE_INODE		4
 #define RPDFS_PLACE_XATTR_BTREE		8
 #define RPDFS_PLACE_DIRENT_BTREE	12
+/* free is always last so that it's flushed after other blocks in its txn */
+#define RPDFS_PLACE_FREE		RPDFS_PLACE_TYPE_MASK
 
 struct rpdfs_msg_block_details {
 	__le64 alloc_ctr;

@@ -80,6 +80,31 @@ int rpdfs_txn_acquire_alloc(struct rpdfs_fs_info *rfi, struct rpdfs_transaction 
 }
 
 /*
+ * Freeing a block marks it dirty and updates its details to be sent
+ * with a distributed write.
+ *
+ * To free the caller must have a write handle.  It lets us implement a
+ * free that can't fail.  At least, as much as modifying and dirtying
+ * can't fail.  Acquiring the handle also revoked other cached blocks
+ * across the cluster and prepares the block to be visible to free
+ * stripe requests once its details indicate that it's free.
+ *
+ * The free place ordered after all other block types so that flush
+ * won't touch free blocks until the txn has released the write handles
+ * on all other blocks in the txn.  This would let the txn satisfy
+ * allocations without errors by using blocks that were freed in its
+ * txn.  (But that's not implemented..  we'd need some storage in the
+ * txn to remember the freed blocks.)
+ */
+void rpdfs_txn_free_block(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
+			  struct rpdfs_block_handle *hnd)
+{
+	/* set place first, dirtying checks place to update alloc_ctr */
+	rpdfs_block_set_place(hnd, RPDFS_PLACE_FREE, 0, 0, hnd->bnr);
+	rpdfs_txn_block_dirty(rfi, txn, hnd);
+}
+
+/*
  * The transaction will not be used again.  Clean up any remaining state
  * so that the caller can destroy it.
  */
