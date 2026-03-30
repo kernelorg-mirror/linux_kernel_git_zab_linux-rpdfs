@@ -141,7 +141,7 @@ struct rpdfs_msg_free_stripe_request {
  * This matches the number of dev_details entries in each details block
  * in devd.
  */
-#define RPDFS_MSG_BLOCKS_PER_FREE_STRIPE 127
+#define RPDFS_MSG_BLOCKS_PER_FREE_STRIPE 101
 
 /*
  * Each grant covers a fixed number of blocks.  The bmap indicates which
