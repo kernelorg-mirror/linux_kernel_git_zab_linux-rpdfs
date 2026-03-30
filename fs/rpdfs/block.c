@@ -1258,7 +1258,8 @@ int rpdfs_block_acquire(struct rpdfs_fs_info *rfi, u64 bnr, struct rpdfs_block_h
 	int ret;
 
 	if (WARN_ON_ONCE((rbaf & RBAF_OVERWRITE) && !(rbaf & RBAF_WRITE)) ||
-	    WARN_ON_ONCE(*hnd_ret != NULL)) {
+	    WARN_ON_ONCE(*hnd_ret != NULL) ||
+	    WARN_ON_ONCE(bnr == 0)) {
 		ret = -EINVAL;
 		goto out;
 	}
