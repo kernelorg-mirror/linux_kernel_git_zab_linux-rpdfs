@@ -470,22 +470,6 @@ static struct rpdfs_block *lookup_block(struct rpdfs_block_info *binf, u64 bnr)
 	return bk;
 }
 
-static void publish_region_rcu(struct rcu_head *head)
-{
-	struct rpdfs_block_region_builder *rbld;
-
-	rbld = container_of(head, struct rpdfs_block_region_builder, hte.rcu);
-	rpdfs_balloc_publish_region(rbld->rfi, rbld->reg);
-	kfree(rbld);
-}
-
-/*
- * We need to wait for a grace period before rcu readers are done with
- * the region and we can hand it off to balloc.  So we model it like
- * kfree_rcu.  Once no requests are in flight and the refcounts drop we
- * hand off to an rcu callback which publishes it with balloc once the
- * grace period ends.
- */
 static void put_rbld(struct rpdfs_block_info *binf, struct rpdfs_block_region_builder *rbld)
 {
 	if (IS_ERR_OR_NULL(rbld))
@@ -495,7 +479,7 @@ static void put_rbld(struct rpdfs_block_info *binf, struct rpdfs_block_region_bu
 	if (rpdfs_ht_put(&binf->rbld_ht, &rbld->hte, rbld_ht_params,
 			 atomic_read(&rbld->in_flight) == 0)) {
 		atomic64_inc(&binf->regions_done);
-		call_rcu(&rbld->hte.rcu, publish_region_rcu);
+		kfree_rcu(rbld, hte.rcu);
 	}
 	rcu_read_unlock();
 }
@@ -1708,6 +1692,7 @@ static int recv_free_stripe_grant(struct rpdfs_fs_info *rfi, struct rpdfs_net_me
 	unsigned long stripes;
 	struct rpdfs_block *bk;
 	int nr_blocks;
+	int in_flight;
 	u64 mver;
 	u64 bnr;
 	int b;
@@ -1762,27 +1747,31 @@ static int recv_free_stripe_grant(struct rpdfs_fs_info *rfi, struct rpdfs_net_me
 		goto out;
 	}
 
-	/* only the first search result for a given rbld will send requests to others */
-	if (fsg->flags & RPDFS_MSG_FREE_STRIPE_GRANT_FLAG_SEARCH) {
-		if (atomic_cmpxchg(&rbld->in_flight, stripes, stripes - 1) == stripes) {
-			for (i = 0; i < stripes; i++) {
-				if (i == this_stripe)
-					continue;
-				ret = send_free_stripe_request(rfi, bnr + i, 0, GFP_NOFS);
-				if (ret < 0)
-					atomic_dec(&rbld->in_flight);
-			}
-		}
-	} else {
-		atomic_dec(&rbld->in_flight);
-	}
-
 	spin_lock(&rbld->lock);
 	rpdfs_balloc_set_stripe_bits(rbld->reg, this_stripe, stripes, fsg->bmap,
 				     RPDFS_MSG_BLOCKS_PER_FREE_STRIPE);
 	spin_unlock(&rbld->lock);
 
-	/* reg is published to balloc in rcu calback once in_flight == 0 */
+	/* only the first search result for a given rbld will send requests to others */
+	if (fsg->flags & RPDFS_MSG_FREE_STRIPE_GRANT_FLAG_SEARCH) {
+		in_flight = atomic_cmpxchg(&rbld->in_flight, stripes, stripes - 1) - 1;
+		if (in_flight == stripes - 1) {
+			for (i = 0; i < stripes; i++) {
+				if (i == this_stripe)
+					continue;
+				ret = send_free_stripe_request(rfi, bnr + i, 0, GFP_NOFS);
+				if (ret < 0)
+					in_flight = atomic_dec_return(&rbld->in_flight);
+			}
+		}
+	} else {
+		in_flight = atomic_dec_return(&rbld->in_flight);
+	}
+
+	/* publish the region if all requests are answered (or failed to send) */
+	if (in_flight == 0)
+		rpdfs_balloc_publish_region(rbld->rfi, rbld->reg);
+
 	put_rbld(binf, rbld);
 
 	ret = 0;
