@@ -4,6 +4,8 @@
 
 #include <linux/list.h>
 
+struct rpdfs_transaction;
+
 #include "block.h"
 #include "place.h"
 #include "super.h"
@@ -15,15 +17,13 @@ typedef u8 __bitwise rbaf_t;
  */
 enum {
 	/*
-	 * Get an exclusive write handle.  The acquired handle *does
-	 * not* immediately allow modifying the block.  It intends to
-	 * eventually modify blocks via a transaction's apply phase
-	 * after the blocks are dirtied.  Acquisition will block until
-	 * there are no concurrent read or write handles, but the block
-	 * can be being flushed and dirty while a write handle is held.
+	 * Get an exclusive write handle.  The caller can modify block
+	 * and the block is considered dirty and can be written out once
+	 * the caller releases their handle (and all dirty handles in
+	 * their transaction).
 	 *
-	 * Without _WRITE the handle has no intention of modifying the
-	 * block and is shared with other !_WRITE handles.
+	 * Without _WRITE the handle can't be modified and is shared
+	 * with other !_WRITE handles.
 	 */
 	_RBAF_WRITE,
 
@@ -89,8 +89,8 @@ static inline void rpdfs_block_set_place(struct rpdfs_block_handle *hnd, u8 type
 	hnd->place = rpdfs_place_full(type, ino, depth, off);
 }
 
-int rpdfs_block_acquire(struct rpdfs_fs_info *rfi, u64 bnr, struct rpdfs_block_handle **hnd_ret,
-			rbaf_t rbaf);
+int rpdfs_block_acquire(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn, u64 bnr,
+			struct rpdfs_block_handle **hnd_ret, rbaf_t rbaf);
 void rpdfs_block_release(struct rpdfs_fs_info *rfi, struct rpdfs_block_handle **hnd);
 
 void rpdfs_block_dirty(struct rpdfs_fs_info *rfi, u64 other_bnr, struct rpdfs_block_handle *hnd);

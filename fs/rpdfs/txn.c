@@ -28,14 +28,6 @@
  * yet (*fingers crossed*).
  */
 
-void rpdfs_txn_block_dirty(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
-			   struct rpdfs_block_handle *hnd)
-{
-	rpdfs_block_dirty(rfi, txn->dirty_bnr, hnd);
-	if (txn->dirty_bnr == 0)
-		txn->dirty_bnr = hnd->bnr;
-}
-
 static int alloc_from_region(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn, u64 *bnr)
 {
 	int ret;
@@ -72,7 +64,7 @@ int rpdfs_txn_acquire_alloc(struct rpdfs_fs_info *rfi, struct rpdfs_transaction 
 	do {
 		ret = alloc_from_region(rfi, txn, &bnr);
 		if (ret == 0)
-			ret = rpdfs_block_acquire(rfi, bnr, hnd,
+			ret = rpdfs_block_acquire(rfi, txn, bnr, hnd,
 						  RBAF_ALLOC | RBAF_WRITE | RBAF_OVERWRITE);
 	} while (ret == -ENODATA);
 
@@ -80,8 +72,8 @@ int rpdfs_txn_acquire_alloc(struct rpdfs_fs_info *rfi, struct rpdfs_transaction 
 }
 
 /*
- * Freeing a block marks it dirty and updates its details to be sent
- * with a distributed write.
+ * Freeing a block updates its alloc_ctr and place details to record
+ * that it's free.
  *
  * To free the caller must have a write handle.  It lets us implement a
  * free that can't fail.  At least, as much as modifying and dirtying
@@ -89,7 +81,7 @@ int rpdfs_txn_acquire_alloc(struct rpdfs_fs_info *rfi, struct rpdfs_transaction 
  * across the cluster and prepares the block to be visible to free
  * stripe requests once its details indicate that it's free.
  *
- * The free place ordered after all other block types so that flush
+ * The free place is ordered after all other block types so that flush
  * won't touch free blocks until the txn has released the write handles
  * on all other blocks in the txn.  This would let the txn satisfy
  * allocations without errors by using blocks that were freed in its
@@ -99,9 +91,9 @@ int rpdfs_txn_acquire_alloc(struct rpdfs_fs_info *rfi, struct rpdfs_transaction 
 void rpdfs_txn_free_block(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
 			  struct rpdfs_block_handle *hnd)
 {
-	/* set place first, dirtying checks place to update alloc_ctr */
 	rpdfs_block_set_place(hnd, RPDFS_PLACE_FREE, 0, 0, hnd->bnr);
-	rpdfs_txn_block_dirty(rfi, txn, hnd);
+	if ((hnd->alloc_ctr & 1) == 1)
+		hnd->alloc_ctr++;
 }
 
 /*

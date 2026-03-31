@@ -70,15 +70,15 @@ int rpdfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 
 struct inode *rpdfs_iget(struct super_block *sb, struct rpdfs_ino_gen *ig);
 struct inode *rpdfs_new_inode(struct super_block *sb, struct rpdfs_ino_gen *ig);
-int rpdfs_inode_acquire_ordered(struct rpdfs_fs_info *rfi,
+int rpdfs_inode_acquire_ordered(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
 				struct inode *a, struct rpdfs_block_handle **a_hnd,
 				struct inode *b, struct rpdfs_block_handle **b_hnd,
 				struct inode *c, struct rpdfs_block_handle **c_hnd,
 				struct inode *d, struct rpdfs_block_handle **d_hnd, rbaf_t rbaf);
-int rpdfs_inode_acquire(struct rpdfs_fs_info *rfi, struct inode *inode,
-			struct rpdfs_block_handle **hnd_ret, rbaf_t rbaf);
-void rpdfs_inode_update_dirty(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
-			      struct inode *inode, struct rpdfs_block_handle *hnd);
+int rpdfs_inode_acquire(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
+			struct inode *inode, struct rpdfs_block_handle **hnd, rbaf_t rbaf);
+void rpdfs_inode_update(struct rpdfs_fs_info *rfi, struct inode *inode,
+			struct rpdfs_block_handle *hnd);
 
 int rpdfs_inode_init(void);
 void rpdfs_inode_exit(void);

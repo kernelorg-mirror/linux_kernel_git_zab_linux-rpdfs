@@ -59,8 +59,10 @@ static int split_block(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
 		/* don't hold child while acquiring parent */
 		rpdfs_block_release(rfi, hnd);
 
-		ret = rpdfs_block_acquire(rfi, le64_to_cpu(par_ref->bnr), &par_hnd, RBAF_WRITE) ?:
-		      rpdfs_block_acquire(rfi, le64_to_cpu(ref->bnr), hnd, RBAF_WRITE);
+		ret = rpdfs_block_acquire(rfi, txn, le64_to_cpu(par_ref->bnr), &par_hnd,
+					  RBAF_WRITE) ?:
+		      rpdfs_block_acquire(rfi, txn, le64_to_cpu(ref->bnr), hnd,
+					  RBAF_WRITE);
 		if (ret < 0)
 			goto out;
 	} else {
@@ -83,10 +85,6 @@ static int split_block(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
 	set_btree_place(sib_hnd, place_hi, bt->level);
 
 	rpdfs_btree_split(rfi, root, par_ref, parent, &sib_ref, sib, ref, bt);
-
-	rpdfs_txn_block_dirty(rfi, txn, par_hnd);
-	rpdfs_txn_block_dirty(rfi, txn, sib_hnd);
-	rpdfs_txn_block_dirty(rfi, txn, *hnd);
 
 	if (key <= rpdfs_btree_last_key(sib)) {
 		swap(sib_hnd, *hnd);
@@ -115,10 +113,10 @@ out:
  * time we acquire a handle it might have been cleaned.  We retry
  * because we might then want to try the other sibling if it was dirty.
  */
-static int acquire_sibling(struct rpdfs_fs_info *rfi, struct rpdfs_block_ref *left_ref,
-			   struct rpdfs_block_ref *right_ref, struct rpdfs_block_ref *ref,
-			   struct rpdfs_block_handle **hnd, struct rpdfs_block_ref *sib_ref,
-			   struct rpdfs_block_handle **sib_hnd)
+static int acquire_sibling(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
+			   struct rpdfs_block_ref *left_ref, struct rpdfs_block_ref *right_ref,
+			   struct rpdfs_block_ref *ref, struct rpdfs_block_handle **hnd,
+			   struct rpdfs_block_ref *sib_ref, struct rpdfs_block_handle **sib_hnd)
 {
 	bool swapped;
 	rbaf_t rbaf;
@@ -147,8 +145,8 @@ static int acquire_sibling(struct rpdfs_fs_info *rfi, struct rpdfs_block_ref *le
 			swap(hnd, sib_hnd);
 		}
 
-		ret = rpdfs_block_acquire(rfi, le64_to_cpu(ref->bnr), hnd, RBAF_WRITE) ?:
-		      rpdfs_block_acquire(rfi, le64_to_cpu(sib_ref->bnr), sib_hnd, rbaf);
+		ret = rpdfs_block_acquire(rfi, txn, le64_to_cpu(ref->bnr), hnd, RBAF_WRITE) ?:
+		      rpdfs_block_acquire(rfi, txn, le64_to_cpu(sib_ref->bnr), sib_hnd, rbaf);
 		if (ret < 0) {
 			rpdfs_block_release(rfi, hnd);
 			if (swapped) {
@@ -179,14 +177,14 @@ static int merge_block(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
 	/* release target so we can acquire parent and possibly left sibling in order */
 	rpdfs_block_release(rfi, hnd);
 
-	ret = rpdfs_block_acquire(rfi, le64_to_cpu(par_ref->bnr), &par_hnd, RBAF_WRITE);
+	ret = rpdfs_block_acquire(rfi, txn, le64_to_cpu(par_ref->bnr), &par_hnd, RBAF_WRITE);
 	if (ret < 0)
 		goto out;
 	parent = par_hnd->data;
 
 	/* acquire target and sibling in order, preferring didrty sibling */
 	ret = rpdfs_btree_find_sib_refs(parent, key, &left_ref, &right_ref) ?:
-	      acquire_sibling(rfi, &left_ref, &right_ref, ref, hnd, &sib_ref, &sib_hnd);
+	      acquire_sibling(rfi, txn, &left_ref, &right_ref, ref, hnd, &sib_ref, &sib_hnd);
 	if (ret < 0)
 		goto out;
 
@@ -200,10 +198,6 @@ static int merge_block(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
 		if (parent->nr_items == 0)
 			rpdfs_txn_free_block(rfi, txn, par_hnd);
 	}
-
-	rpdfs_txn_block_dirty(rfi, txn, par_hnd);
-	rpdfs_txn_block_dirty(rfi, txn, sib_hnd);
-	rpdfs_txn_block_dirty(rfi, txn, *hnd);
 
 	ret = 0;
 out:
@@ -254,7 +248,6 @@ static int acquire_leaf(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn
 		if (ret == 0) {
 			rpdfs_btree_init_first_block(root, &ref, hnd->data);
 			set_btree_place(hnd, place_hi, 0);
-			rpdfs_txn_block_dirty(rfi, txn, hnd);
 		}
 		goto out;
 	}
@@ -271,7 +264,8 @@ static int acquire_leaf(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn
 			goto out;
 		}
 
-		ret = rpdfs_block_acquire(rfi, le64_to_cpu(ref.bnr), &hnd, level > 0 ? 0 : rbaf);
+		ret = rpdfs_block_acquire(rfi, txn, le64_to_cpu(ref.bnr), &hnd,
+					  level > 0 ? 0 : rbaf);
 		if (ret < 0)
 			goto out;
 		bt = hnd->data;
@@ -337,8 +331,6 @@ int rpdfs_btree_insert(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
 	if (ret == 0) {
 		bt = hnd->data;
 		ret = rpdfs_btree_insert_cb(rfi, bt, key, cb, arg, kv, nr_segs, val_size);
-		if (ret >= 0)
-			rpdfs_txn_block_dirty(rfi, txn, hnd);
 		rpdfs_block_release(rfi, &hnd);
 	}
 	return ret;
@@ -356,8 +348,6 @@ int rpdfs_btree_modify(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
 	if (ret == 0) {
 		bt = hnd->data;
 		ret = rpdfs_btree_collisions_cb(rfi, bt, key, cb, arg);
-		if (ret >= 0)
-			rpdfs_txn_block_dirty(rfi, txn, hnd);
 		rpdfs_block_release(rfi, &hnd);
 	}
 	return ret;
@@ -376,7 +366,6 @@ int rpdfs_btree_delete(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
 		bt = hnd->data;
 		ret = rpdfs_btree_delete_cb(rfi, root, bt, key, cb, arg);
 		if (ret >= 0) {
-			rpdfs_txn_block_dirty(rfi, txn, hnd);
 			if (bt->nr_items == 0)
 				rpdfs_txn_free_block(rfi, txn, hnd);
 		}

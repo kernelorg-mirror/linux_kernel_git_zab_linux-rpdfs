@@ -192,7 +192,7 @@ static struct dentry *rpdfs_lookup(struct inode *dir, struct dentry *dentry, uns
 
 	init_dent_cb_args(&da, dentry, NULL);
 
-	ret = rpdfs_inode_acquire(rfi, dir, &hnd, 0);
+	ret = rpdfs_inode_acquire(rfi, NULL, dir, &hnd, 0);
 	if (ret < 0)
 		goto out;
 
@@ -254,7 +254,7 @@ static struct inode *create_new_inode(struct mnt_idmap *idmap, struct inode *dir
 	u64 ino;
 	int ret;
 
-	ret = rpdfs_inode_acquire(rfi, dir, &dir_hnd, RBAF_WRITE) ?:
+	ret = rpdfs_inode_acquire(rfi, &txn, dir, &dir_hnd, RBAF_WRITE) ?:
 	      rpdfs_txn_acquire_alloc(rfi, &txn, &inode_hnd);
 	if (ret < 0)
 		goto out;
@@ -295,10 +295,10 @@ static struct inode *create_new_inode(struct mnt_idmap *idmap, struct inode *dir
 	if (S_ISDIR(mode))
 		inc_nlink(dir);
 
-	rpdfs_inode_update_dirty(rfi, &txn, inode, inode_hnd);
+	rpdfs_inode_update(rfi, inode, inode_hnd);
 	ret = 0;
 out:
-	rpdfs_inode_update_dirty(rfi, &txn, dir, dir_hnd);
+	rpdfs_inode_update(rfi, dir, dir_hnd);
 
 	if (ret < 0) {
 		if (!IS_ERR_OR_NULL(inode))
@@ -393,7 +393,7 @@ static int rpdfs_unlink(struct inode *dir, struct dentry *dentry)
 	struct dent_cb_args da;
 	int ret;
 
-	ret = rpdfs_inode_acquire_ordered(rfi, dir, &dir_hnd, inode, &inode_hnd,
+	ret = rpdfs_inode_acquire_ordered(rfi, &txn, dir, &dir_hnd, inode, &inode_hnd,
 					  NULL, NULL, NULL, NULL, RBAF_WRITE);
 	if (ret < 0)
 		goto out;
@@ -417,10 +417,10 @@ static int rpdfs_unlink(struct inode *dir, struct dentry *dentry)
 	update_dir_size(dir, -(dentry->d_name.len + 1));
 	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
 
-	rpdfs_inode_update_dirty(rfi, &txn, inode, inode_hnd);
+	rpdfs_inode_update(rfi, inode, inode_hnd);
 	ret = 0;
 out:
-	rpdfs_inode_update_dirty(rfi, &txn, dir, dir_hnd);
+	rpdfs_inode_update(rfi, dir, dir_hnd);
 
 	rpdfs_block_release(rfi, &dir_hnd);
 	rpdfs_block_release(rfi, &inode_hnd);
@@ -462,7 +462,7 @@ static int rpdfs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct d
 		goto out;
 	}
 
-	ret = rpdfs_inode_acquire_ordered(rfi, old_dir, &old_dir_hnd,
+	ret = rpdfs_inode_acquire_ordered(rfi, &txn, old_dir, &old_dir_hnd,
 					  (new_dir != old_dir) ? new_dir : NULL, &new_dir_hnd,
 					  old_inode, &old_inode_hnd,
 					  new_inode, &new_inode_hnd, RBAF_WRITE);
@@ -522,14 +522,14 @@ static int rpdfs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct d
 	if (new_inode)
 		inode_set_ctime_to_ts(new_inode, now);
 
-	rpdfs_inode_update_dirty(rfi, &txn, old_inode, old_inode_hnd);
+	rpdfs_inode_update(rfi, old_inode, old_inode_hnd);
 	if (new_inode)
-		rpdfs_inode_update_dirty(rfi, &txn, new_inode, new_inode_hnd);
+		rpdfs_inode_update(rfi, new_inode, new_inode_hnd);
 	ret = 0;
 out:
-	rpdfs_inode_update_dirty(rfi, &txn, old_dir, old_dir_hnd);
+	rpdfs_inode_update(rfi, old_dir, old_dir_hnd);
 	if (new_dir != old_dir)
-		rpdfs_inode_update_dirty(rfi, &txn, new_dir, new_dir_hnd);
+		rpdfs_inode_update(rfi, new_dir, new_dir_hnd);
 
 	rpdfs_block_release(rfi, &old_dir_hnd);
 	rpdfs_block_release(rfi, &new_dir_hnd);
@@ -602,7 +602,7 @@ static int rpdfs_readdir(struct file *file, struct dir_context *ctx)
 		goto out;
 	}
 
-	ret = rpdfs_inode_acquire(rfi, inode, &hnd, 0);
+	ret = rpdfs_inode_acquire(rfi, NULL, inode, &hnd, 0);
 	if (ret < 0)
 		goto out;
 

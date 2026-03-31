@@ -169,7 +169,7 @@ static int rpdfs_xattr_get(struct inode *inode, const char *name, void *value, s
 	if (name_len > RPDFS_XATTR_MAX_NAME_LEN)
 		return -ERANGE;
 
-	ret = rpdfs_inode_acquire(rfi, inode, &hnd, 0);
+	ret = rpdfs_inode_acquire(rfi, NULL, inode, &hnd, 0);
 	if (ret < 0)
 		goto out;
 
@@ -222,7 +222,7 @@ static int rpdfs_xattr_set(struct inode *inode, const char *name, const void *va
 	old_xa.value = NULL;
 	old_xa.size = 0;
 
-	ret = rpdfs_inode_acquire(rfi, inode, &hnd, 0);
+	ret = rpdfs_inode_acquire(rfi, &txn, inode, &hnd, RBAF_WRITE);
 	if (ret < 0)
 		goto out;
 
@@ -260,7 +260,7 @@ static int rpdfs_xattr_set(struct inode *inode, const char *name, const void *va
 
 	ret = 0;
 out:
-	rpdfs_inode_update_dirty(rfi, &txn, inode, hnd);
+	rpdfs_inode_update(rfi, inode, hnd);
 	rpdfs_block_release(rfi, &hnd);
 	rpdfs_txn_finish(rfi, &txn);
 

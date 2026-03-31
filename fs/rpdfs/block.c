@@ -787,6 +787,30 @@ static void set_boundary_last_dirty(struct rpdfs_block_info *binf,
 }
 
 /*
+ * Make sure that block a's dirty boundary covers block b's.  This is
+ * used as we dirty blocks in one transaction to to ensure that they're
+ * written together.  This can be called quite a bit for blocks that
+ * remain dirty across multiple operations on those blocks.  We spend
+ * some effort to avoid taking locks when the block is already covered.
+ */
+static void dirty_boundary_covers(struct rpdfs_block *a, struct rpdfs_block *b)
+{
+	struct rpdfs_dirty_boundary bnd;
+	bool less;
+
+	while_read_seqretry(&b->seqlock)
+		bnd = b->dirty_bnd;
+
+	while_read_seqretry(&a->seqlock)
+		less = boundary_any_less(&a->dirty_bnd, &bnd);
+	if (less) {
+		write_seqlock(&a->seqlock);
+		extend_boundary(&a->dirty_bnd, &bnd);
+		write_sequnlock(&a->seqlock);
+	}
+}
+
+/*
  * The caller is an exclusive writer of the block so only we can dirty
  * it, but we use the bk seqlock to consistently serialize with retrying
  * readers.
@@ -811,10 +835,6 @@ static unsigned long make_dirty(struct rpdfs_block_info *binf, struct rpdfs_bloc
 		write_seqcount_begin_nested(&dlist->seqlock.seqcount, SINGLE_DEPTH_NESTING);
 
 		bk->dirty = 1;
-		/* advance alloc_ctr to match pre-dirty place updates on alloc/free */
-		if (!(rpdfs_place_type(bk->hnd.place) == RPDFS_PLACE_FREE) !=
-		    !alloc_ctr_is_free(bk->hnd.alloc_ctr))
-			bk->hnd.alloc_ctr++;
 		bk->hnd.wcount++;
 		bk->dirty_seq = ++dlist->dirty_seq;
 		bk->dirty_list_nr = nr;
@@ -1160,6 +1180,40 @@ static void queue_block_flush(struct rpdfs_block_info *binf, struct rpdfs_block 
 }
 
 /*
+ * Mark the block dirty with the other blocks in the transaction.  If
+ * the transaction has another dirty block then make sure the two block
+ * boundaries cover each other.  Or record that we're the first dirty
+ * block in the txn.
+ */
+static void dirty_in_txn(struct rpdfs_block_info *binf, struct rpdfs_transaction *txn,
+			 struct rpdfs_block *bk)
+{
+	struct rpdfs_dirty_boundary bnd;
+	struct rpdfs_block *other;
+	bool flush = false;
+
+	if (make_dirty(binf, bk) > DIRTY_BLOCK_LIMIT)
+		flush = true;
+
+	if (txn->dirty_bnr) {
+		other = lookup_block(binf, txn->dirty_bnr);
+		if (other) {
+			dirty_boundary_covers(bk, other);
+			dirty_boundary_covers(other, bk);
+			put_block(other);
+		}
+	} else {
+		txn->dirty_bnr = bk->hnd.bnr;
+	}
+
+	if (flush) {
+		while_read_seqretry(&bk->seqlock)
+			bnd = bk->dirty_bnd;
+		queue_boundary_flush(binf, &bnd);
+	}
+}
+
+/*
  * See if the caller can acquire the block with their mode and flags.
  * This is primarily called under a write seqlock when the caller will
  * act on the return.  It's also called during a read seqlock retry as a
@@ -1246,10 +1300,13 @@ static bool retry_acquire(struct rpdfs_block_info *binf, struct rpdfs_block *bk,
  * the handle when the caller is done.
  *
  * With no flags, a readable handle is returned.  _WRITE acquires a
- * write handle which may be dirtied and will exclude all other handles.
+ * write handle excludes all other handles.
+ *
+ * A transaction must be provided along with _WRITE to dirty blocks
+ * together in the transaction.
  */
-int rpdfs_block_acquire(struct rpdfs_fs_info *rfi, u64 bnr, struct rpdfs_block_handle **hnd_ret,
-			rbaf_t rbaf)
+int rpdfs_block_acquire(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn, u64 bnr,
+			struct rpdfs_block_handle **hnd_ret, rbaf_t rbaf)
 {
 	struct rpdfs_block_info *binf = RPDFS_BINF(rfi);
 	struct rpdfs_block *bk = NULL;
@@ -1258,6 +1315,7 @@ int rpdfs_block_acquire(struct rpdfs_fs_info *rfi, u64 bnr, struct rpdfs_block_h
 	int ret;
 
 	if (WARN_ON_ONCE((rbaf & RBAF_OVERWRITE) && !(rbaf & RBAF_WRITE)) ||
+	    WARN_ON_ONCE((rbaf & RBAF_WRITE) && !txn) ||
 	    WARN_ON_ONCE(*hnd_ret != NULL) ||
 	    WARN_ON_ONCE(bnr == 0)) {
 		ret = -EINVAL;
@@ -1311,6 +1369,8 @@ int rpdfs_block_acquire(struct rpdfs_fs_info *rfi, u64 bnr, struct rpdfs_block_h
 				bk->readers++;
 			if (rbaf & RBAF_OVERWRITE)
 				bk->error = 0;
+			if (rbaf & RBAF_ALLOC)
+				bk->hnd.alloc_ctr++;
 			*hnd_ret = &bk->hnd;
 		}
 
@@ -1319,6 +1379,8 @@ int rpdfs_block_acquire(struct rpdfs_fs_info *rfi, u64 bnr, struct rpdfs_block_h
 		rpdfs_net_preload_end(rfi);
 
 		if (ret == CAN_ACQUIRE) {
+			if (rbaf & RBAF_WRITE)
+				dirty_in_txn(binf, txn, bk);
 			ret = 0;
 			break;
 		}
@@ -1391,60 +1453,6 @@ void rpdfs_block_release(struct rpdfs_fs_info *rfi, struct rpdfs_block_handle **
 	 * read-only, abort, etc.
 	 */
 	BUG_ON(send_ret < 0);
-}
-
-/*
- * Make sure that block a's dirty boundary covers block b's.  This is
- * used as we dirty blocks in one transaction to to ensure that they're
- * written together.  This can be called quite a bit for blocks that
- * remain dirty across multiple operations on those blocks.  We spend
- * some effort to avoid taking locks when the block is already covered.
- */
-static void dirty_boundary_covers(struct rpdfs_block *a, struct rpdfs_block *b)
-{
-	struct rpdfs_dirty_boundary bnd;
-	bool less;
-
-	while_read_seqretry(&b->seqlock)
-		bnd = b->dirty_bnd;
-
-	while_read_seqretry(&a->seqlock)
-		less = boundary_any_less(&a->dirty_bnd, &bnd);
-	if (less) {
-		write_seqlock(&a->seqlock);
-		extend_boundary(&a->dirty_bnd, &bnd);
-		write_sequnlock(&a->seqlock);
-	}
-}
-
-/*
- * Mark the held block dirty.  If another block number is given then it
- * was also dirtied in the caller's transaction.  Make sure that our
- * block is dirty and that the dirty boundaries of both cover each
- * other.
- */
-void rpdfs_block_dirty(struct rpdfs_fs_info *rfi, u64 other_bnr, struct rpdfs_block_handle *hnd)
-{
-	struct rpdfs_block_info *binf = RPDFS_BINF(rfi);
-	struct rpdfs_block *bk = container_of(hnd, struct rpdfs_block, hnd);
-	struct rpdfs_dirty_boundary bnd;
-	struct rpdfs_block *other;
-	bool flush = false;
-
-	if (make_dirty(binf, bk) > DIRTY_BLOCK_LIMIT)
-		flush = true;
-
-	if (other_bnr && (other = lookup_block(binf, other_bnr))) {
-		dirty_boundary_covers(bk, other);
-		dirty_boundary_covers(other, bk);
-		put_block(other);
-	}
-
-	if (flush) {
-		while_read_seqretry(&bk->seqlock)
-			bnd = bk->dirty_bnd;
-		queue_boundary_flush(binf, &bnd);
-	}
 }
 
 /*

@@ -16,13 +16,14 @@
 int rpdfs_mkfs(struct rpdfs_fs_info *rfi)
 {
 	struct rpdfs_block_handle *hnd = NULL;
+	struct rpdfs_transaction txn = RPDFS_INIT_TXN;
 	struct rpdfs_inode *rinode;
 	u64 bnr;
 	int ret;
 
 	bnr = rpdfs_ino_bnr(RPDFS_ROOT_INO);
 
-	ret = rpdfs_block_acquire(rfi, bnr, &hnd, RBAF_WRITE | RBAF_OVERWRITE);
+	ret = rpdfs_block_acquire(rfi, &txn, bnr, &hnd, RBAF_WRITE | RBAF_OVERWRITE);
 	if (ret < 0)
 		goto out;
 
@@ -41,8 +42,9 @@ int rpdfs_mkfs(struct rpdfs_fs_info *rfi)
 	rinode->crtime_nsec = rinode->atime_nsec;
 
 	rpdfs_block_set_place(hnd, RPDFS_PLACE_INODE, RPDFS_ROOT_INO, 0, 0);
-	rpdfs_block_dirty(rfi, 0, hnd);
 	rpdfs_block_release(rfi, &hnd);
+	rpdfs_txn_finish(rfi, &txn);
+
 	ret = rpdfs_block_flush(rfi, bnr, true);
 out:
 	return ret;

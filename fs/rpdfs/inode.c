@@ -183,7 +183,7 @@ static int rpdfs_read_inode(struct rpdfs_fs_info *rfi, struct inode *inode)
 	struct rpdfs_inode *rinode;
 	int ret;
 
-	ret = rpdfs_block_acquire(rfi, bnr, &hnd, 0);
+	ret = rpdfs_block_acquire(rfi, NULL, bnr, &hnd, 0);
 	if (ret < 0)
 		goto out;
 
@@ -343,7 +343,7 @@ static int cmp_inode_ino(const void *a, const void *b)
  * On success all the non-null handles have been acquired and must be
  * released by the caller.
  */
-int rpdfs_inode_acquire_ordered(struct rpdfs_fs_info *rfi,
+int rpdfs_inode_acquire_ordered(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
 				struct inode *a, struct rpdfs_block_handle **a_hnd,
 				struct inode *b, struct rpdfs_block_handle **b_hnd,
 				struct inode *c, struct rpdfs_block_handle **c_hnd,
@@ -362,8 +362,8 @@ int rpdfs_inode_acquire_ordered(struct rpdfs_fs_info *rfi,
 		if (!sorted[i].inode)
 			break;
 
-		ret = rpdfs_block_acquire(rfi, rpdfs_inode_bnr(sorted[i].inode), sorted[i].hnd,
-					  rbaf);
+		ret = rpdfs_block_acquire(rfi, txn, rpdfs_inode_bnr(sorted[i].inode),
+					  sorted[i].hnd, rbaf);
 		if (ret < 0) {
 			while (i-- > 0)
 				rpdfs_block_release(rfi, sorted[i].hnd);
@@ -379,12 +379,12 @@ int rpdfs_inode_acquire_ordered(struct rpdfs_fs_info *rfi,
  * Acquire a handle on the block containing the inode.  Once acquired,
  * make sure the inode matches the current contents of the block.
  */
-int rpdfs_inode_acquire(struct rpdfs_fs_info *rfi, struct inode *inode,
-			struct rpdfs_block_handle **hnd, rbaf_t rbaf)
+int rpdfs_inode_acquire(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
+			struct inode *inode, struct rpdfs_block_handle **hnd, rbaf_t rbaf)
 {
 	int ret;
 
-	ret = rpdfs_block_acquire(rfi, rpdfs_inode_bnr(inode), hnd, rbaf);
+	ret = rpdfs_block_acquire(rfi, txn, rpdfs_inode_bnr(inode), hnd, rbaf);
 	if (ret == 0)
 		rpdfs_inode_refresh(rfi, inode, *hnd);
 
@@ -407,8 +407,8 @@ int rpdfs_inode_acquire(struct rpdfs_fs_info *rfi, struct inode *inode,
  * unconditionally called in exit paths regardless of whether the inode
  * handle was acquired.
  */
-void rpdfs_inode_update_dirty(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
-			      struct inode *inode, struct rpdfs_block_handle *hnd)
+void rpdfs_inode_update(struct rpdfs_fs_info *rfi, struct inode *inode,
+			struct rpdfs_block_handle *hnd)
 {
 	struct rpdfs_inode_info *ri;
 	struct rpdfs_inode *rinode;
@@ -458,7 +458,7 @@ int rpdfs_getattr(struct mnt_idmap *idmap, const struct path *path,
 	struct rpdfs_inode *rinode;
 	int ret;
 
-	ret = rpdfs_inode_acquire(rfi, inode, &hnd, 0);
+	ret = rpdfs_inode_acquire(rfi, NULL, inode, &hnd, 0);
 	if (ret < 0)
 		goto out;
 
@@ -483,7 +483,7 @@ int rpdfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr *
 	struct rpdfs_block_handle *hnd = NULL;
 	int ret;
 
-	ret = rpdfs_inode_acquire(rfi, inode, &hnd, RBAF_WRITE);
+	ret = rpdfs_inode_acquire(rfi, &txn, inode, &hnd, RBAF_WRITE);
 	if (ret < 0)
 		goto out;
 
@@ -491,7 +491,7 @@ int rpdfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr *
 	if (ret == 0) {
 		setattr_copy(idmap, inode, attr);
 		inode_inc_iversion(inode);
-		rpdfs_inode_update_dirty(rfi, &txn, inode, hnd);
+		rpdfs_inode_update(rfi, inode, hnd);
 	}
 
 out:

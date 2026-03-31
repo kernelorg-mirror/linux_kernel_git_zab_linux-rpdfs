@@ -3,6 +3,7 @@
 #define RPDFS_TXN_H
 
 struct rpdfs_balloc_region;
+struct rpdfs_block_handle;
 
 #include "block.h"
 #include "super.h"
@@ -14,8 +15,6 @@ struct rpdfs_transaction {
 
 #define RPDFS_INIT_TXN {0,}
 
-void rpdfs_txn_block_dirty(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
-			   struct rpdfs_block_handle *hnd);
 int rpdfs_txn_acquire_alloc(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
 			    struct rpdfs_block_handle **hnd_ret);
 void rpdfs_txn_free_block(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
