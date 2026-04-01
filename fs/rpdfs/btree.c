@@ -11,6 +11,7 @@
 #include "btree.h"
 #include "compare.h"
 #include "format-block.h"
+#include "pr.h"
 #include "string.h"
 
 /*
@@ -261,6 +262,134 @@ static inline void memmove_items(struct rpdfs_btree_block *bt, u16 ind, int dist
 	if (ind < nr)
 		memmove(&bt->items[ind + dist], &bt->items[ind],
 			(nr - ind) * sizeof(bt->items[0]));
+}
+
+__always_unused
+static bool check_item(struct rpdfs_btree_block *bt, u16 i, bool print)
+{
+	u64 key = item_key(bt, i);
+	u16 off = item_off(bt, i);
+	u16 size = item_size(bt, i);
+	bool valid = true;
+	size_t after_this = offsetof(struct rpdfs_btree_block, items[i + 1]);
+
+	if (size > RPDFS_BTREE_MAX_VAL_SIZE) {
+		if (print)
+			rpdfs_err("item %u size %u is too large", i, size);
+		valid = false;
+	}
+
+	if (!IS_ALIGNED(off, RPDFS_BTREE_VAL_ALIGN)) {
+		if (print)
+			rpdfs_err("item %u off %u not aligned", i, off);
+		valid = false;
+	}
+
+	if (off < after_this || off >= RPDFS_BLOCK_SIZE) {
+		if (print)
+			rpdfs_err("item %u off %u outside values", i, off);
+		valid = false;
+	}
+
+	if (off + size > RPDFS_BLOCK_SIZE) {
+		if (print)
+			rpdfs_err("item %u off+size %u+%u exceeds block", i, off, size);
+		valid = false;
+	}
+
+	if (i > 0 && key <= item_key(bt, i - 1)) {
+		if (print)
+			rpdfs_err("item %u key %llx <= prev key %llx", i,
+				  key, item_key(bt, i - 1));
+		valid = false;
+	}
+
+	return valid;
+}
+
+__always_unused
+static void check_block(struct rpdfs_btree_block *bt)
+{
+	bool valid = true;
+	u16 total_val_size;
+	u16 first_off;
+	u16 first_free;
+	u16 nr;
+	int i;
+
+	nr = le16_to_cpu(bt->nr_items);
+	if (offsetof(struct rpdfs_btree_block, items[nr]) > RPDFS_BLOCK_SIZE) {
+		/* guess a nr based on first sketchy item */
+		nr = (RPDFS_BLOCK_SIZE - sizeof(struct rpdfs_btree_block)) / sizeof(bt->items[0]);
+		for (i = 0; i < nr; i++) {
+			if (!check_item(bt, i, false)) {
+				nr = i;
+				break;
+			}
+		}
+		rpdfs_err("nr %u is too large, guessing nr %u",
+			  le16_to_cpu(bt->nr_items), nr);
+		valid = false;
+	}
+
+	if (le16_to_cpu(bt->avail_free) > RPDFS_BLOCK_SIZE) {
+		rpdfs_err("avail free %u is too large", le16_to_cpu(bt->avail_free));
+		valid = false;
+	}
+
+	if (le16_to_cpu(bt->total_free) > RPDFS_BLOCK_SIZE) {
+		rpdfs_err("total free %u is too large", le16_to_cpu(bt->total_free));
+		valid = false;
+	}
+
+	if (le16_to_cpu(bt->avail_free) > le16_to_cpu(bt->total_free)) {
+		rpdfs_err("avail free %u greater than total free %u",
+			  le16_to_cpu(bt->avail_free), le16_to_cpu(bt->total_free));
+		valid = false;
+	}
+
+	first_off = RPDFS_BLOCK_SIZE;
+	total_val_size = 0;
+	for (i = 0; i < nr; i++) {
+		if (check_item(bt, i, true)) {
+			first_off = min(item_off(bt, i), first_off);
+			total_val_size += aligned_val_size(item_size(bt, i));
+		} else {
+			valid = false;
+		}
+	}
+
+	first_free = offsetof(struct rpdfs_btree_block, items[nr]);
+
+	/* avail_free isn't always updated on deletion, just can't cover a value */
+	if (le16_to_cpu(bt->avail_free) > first_off - first_free) {
+		rpdfs_err("avail free %u > first_off %u - first_free %u",
+			  le16_to_cpu(bt->avail_free), first_off, first_free);
+		valid = false;
+	}
+
+	if (le16_to_cpu(bt->total_free) != (RPDFS_BLOCK_SIZE - first_free - total_val_size)) {
+		rpdfs_err("total free %u !~ free %u total %u",
+			  le16_to_cpu(bt->total_free), first_free, total_val_size);
+		valid = false;
+	}
+
+	if (!valid) {
+		rpdfs_err("found invalid btree block:");
+		rpdfs_err("  nr_items: %u", le16_to_cpu(bt->nr_items));
+		rpdfs_err("  avail_free: %u", le16_to_cpu(bt->avail_free));
+		rpdfs_err("  total_free: %u", le16_to_cpu(bt->total_free));
+		rpdfs_err("  level: %u", bt->level);
+		for (i = 0; i < nr; i++) {
+			rpdfs_err("  [%u]: %llx (key %llx off %u size %u)",
+				  i, le64_to_cpu(bt->items[i]),
+				  item_key(bt, i), item_off(bt, i), item_size(bt, i));
+		}
+
+		print_hex_dump(KERN_DEBUG, "   ", DUMP_PREFIX_OFFSET, 16, 1,
+			       bt, RPDFS_BLOCK_SIZE, true);
+		BUG();
+	}
 }
 
 /*
