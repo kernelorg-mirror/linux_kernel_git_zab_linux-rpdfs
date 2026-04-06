@@ -455,7 +455,7 @@ int rpdfs_getattr(struct mnt_idmap *idmap, const struct path *path,
 	struct inode *inode = d_inode(path->dentry);
 	struct rpdfs_fs_info *rfi = RPDFS_INODE_FS(inode);
 	struct rpdfs_block_handle *hnd = NULL;
-	struct rpdfs_inode *rinode;
+	struct rpdfs_inode_info *ri;
 	int ret;
 
 	ret = rpdfs_inode_acquire(rfi, NULL, inode, &hnd, 0);
@@ -463,9 +463,9 @@ int rpdfs_getattr(struct mnt_idmap *idmap, const struct path *path,
 		goto out;
 
 	if (request_mask & STATX_BTIME) {
-		rinode = hnd->data;
+		ri = RPDFS_I(inode);
 		stat->result_mask |= STATX_BTIME;
-		stat->btime = ns_to_timespec64(le64_to_cpu(rinode->crtime_nsec));
+		stat->btime = ns_to_timespec64(le64_to_cpu(ri->crtime_nsec));
 	}
 
 	generic_fillattr(idmap, request_mask, inode, stat);
