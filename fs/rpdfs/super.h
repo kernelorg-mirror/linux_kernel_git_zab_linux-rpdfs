@@ -4,6 +4,7 @@
 
 #include <linux/fs.h>
 #include <linux/inet.h>
+#include <linux/uuid.h>
 
 struct rpdfs_fs_info;
 
@@ -15,6 +16,7 @@ struct rpdfs_map_info;
 struct rpdfs_net_info;
 
 struct rpdfs_fs_info {
+	u8 client_uuid[UUID_SIZE];
 	struct rpdfs_balloc_info *balloc_info;
 	struct rpdfs_block_info *block_info;
 	struct rpdfs_map_info *map_info;

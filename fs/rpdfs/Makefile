@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: GPL-2.0
 
+#
+# When building as an external module let define_trace.h find
+# TRACE_INCLUDE_PATH="."
+#
+CFLAGS_rpdfs_trace.o = -I$(src)
+
 obj-$(CONFIG_RPDFS_FS) += rpdfs.o
 
 rpdfs-y	:= balloc.o \
@@ -16,6 +22,7 @@ rpdfs-y	:= balloc.o \
 	   net_tcp.o \
 	   parse.o \
 	   rht.o \
+	   rpdfs_trace.o \
 	   super.o \
 	   txn.o \
 	   xattr.o

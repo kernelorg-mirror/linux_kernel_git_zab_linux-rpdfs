@@ -17,6 +17,7 @@
 #include "net_tcp.h"
 #include "parse.h"
 #include "pr.h"
+#include "rpdfs_trace.h"
 #include "xattr.h"
 
 struct rpdfs_fs_context {
@@ -125,6 +126,9 @@ static int rpdfs_get_tree(struct fs_context *fc)
 		goto out;
 	}
 
+	/* generate as early as possible for tracing */
+	generate_random_uuid(rfi->client_uuid);
+
 	fc->s_fs_info = rfi;
 	sb = sget_fc(fc, NULL, rpdfs_set_super);
 	fc->s_fs_info = NULL;
@@ -132,6 +136,9 @@ static int rpdfs_get_tree(struct fs_context *fc)
 		ret = PTR_ERR(sb);
 		goto out;
 	}
+
+	/* use the uuid as a little fingerprint for now, might prefer client qlist id */
+	snprintf(sb->s_id, sizeof(sb->s_id), RFI_TRACE_TPF, RFI_TRACE_ID(rfi));
 
 	/*
 	 * XXX We hack together an analog of a map with the devd
