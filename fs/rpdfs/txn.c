@@ -69,6 +69,7 @@ int rpdfs_txn_acquire_alloc(struct rpdfs_fs_info *rfi, struct rpdfs_transaction 
 						  RBAF_ALLOC | RBAF_WRITE | RBAF_OVERWRITE);
 	} while (ret == -ENODATA);
 
+	trace_rpdfs_txn_acquire_alloc(rfi, txn, (*hnd)->bnr, ret);
 	return ret;
 }
 

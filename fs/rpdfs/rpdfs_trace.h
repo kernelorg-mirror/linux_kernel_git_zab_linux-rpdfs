@@ -18,6 +18,7 @@
 #include "trace/common.h"
 
 #include "trace/alloc.h"
+#include "trace/txn.h"
 
 #endif /* _TRACE_RPDFS_H */
 
