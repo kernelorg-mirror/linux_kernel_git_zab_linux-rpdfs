@@ -27,6 +27,9 @@ int rpdfs_mkfs(struct rpdfs_fs_info *rfi)
 	if (ret < 0)
 		goto out;
 
+	/* we're not going through normal RBAF_ALLOC, update by hand */
+	hnd->alloc_ctr = 1;
+
 	memset(hnd->data, 0, RPDFS_BLOCK_SIZE);
 	rinode = hnd->data;
 
