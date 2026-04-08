@@ -8,6 +8,7 @@
 #include "balloc.h"
 #include "block.h"
 #include "pr.h"
+#include "rpdfs_trace.h"
 #include "txn.h"
 
 /*
@@ -41,7 +42,7 @@ static int alloc_from_region(struct rpdfs_fs_info *rfi, struct rpdfs_transaction
 		}
 	}
 
-	ret = rpdfs_balloc_alloc_bnr(txn->reg, bnr);
+	ret = rpdfs_balloc_alloc_bnr(rfi, txn->reg, bnr);
 	if (ret < 0 || txn->reg->nr_set == 0) {
 		rpdfs_balloc_free_region(txn->reg);
 		txn->reg = NULL;

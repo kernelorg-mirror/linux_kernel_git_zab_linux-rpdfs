@@ -17,6 +17,8 @@
 
 #include "trace/common.h"
 
+#include "trace/alloc.h"
+
 #endif /* _TRACE_RPDFS_H */
 
 /* This part must be outside protection */

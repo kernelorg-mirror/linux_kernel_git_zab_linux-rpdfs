@@ -8,6 +8,7 @@
 #include "balloc.h"
 #include "block.h"
 #include "pr.h"
+#include "rpdfs_trace.h"
 #include "seqlock.h"
 #include "super.h"
 #include "txn.h"
@@ -78,7 +79,8 @@ void rpdfs_balloc_set_stripe_bits(struct rpdfs_balloc_region *reg, unsigned long
 	}
 }
 
-int rpdfs_balloc_alloc_bnr(struct rpdfs_balloc_region *reg, u64 *bnr_ret)
+int rpdfs_balloc_alloc_bnr(struct rpdfs_fs_info *rfi, struct rpdfs_balloc_region *reg,
+			   u64 *bnr_ret)
 {
 	unsigned long b;
 	int ret;
@@ -95,8 +97,7 @@ int rpdfs_balloc_alloc_bnr(struct rpdfs_balloc_region *reg, u64 *bnr_ret)
 		ret = 0;
 	}
 
-	rpdfs_prd(REGF" bnr %llu ret %d", REGA(reg), *bnr_ret, ret);
-
+	trace_rpdfs_alloc_bnr(rfi, reg, *bnr_ret, ret);
 	return ret;
 }
 

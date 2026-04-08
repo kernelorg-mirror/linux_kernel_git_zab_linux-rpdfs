@@ -4,6 +4,7 @@
 
 #include <linux/types.h>
 
+struct rpdfs_fs_info;
 struct rpdfs_transaction;
 
 #include "format-msg.h"
@@ -31,7 +32,8 @@ void rpdfs_balloc_set_stripe_bits(struct rpdfs_balloc_region *reg, unsigned long
 				  unsigned long stripes, __le64 *bmap, unsigned long size);
 void rpdfs_balloc_publish_region(struct rpdfs_fs_info *rfi, struct rpdfs_balloc_region *reg);
 
-int rpdfs_balloc_alloc_bnr(struct rpdfs_balloc_region *reg, u64 *bnr_ret);
+int rpdfs_balloc_alloc_bnr(struct rpdfs_fs_info *rfi, struct rpdfs_balloc_region *reg,
+			   u64 *bnr_ret);
 
 struct rpdfs_balloc_region *rpdfs_balloc_take_region(struct rpdfs_fs_info *rfi);
 void rpdfs_balloc_return_region(struct rpdfs_fs_info *rfi, struct rpdfs_balloc_region *reg);
