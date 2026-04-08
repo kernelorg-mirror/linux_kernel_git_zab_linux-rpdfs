@@ -1969,6 +1969,7 @@ static void remove_isolated_list(struct rpdfs_block_info *binf, struct list_head
 
 	list_for_each_entry_safe(bk, bk__, isolated, lru_head) {
 		rhashtable_remove_fast(&binf->block_ht, &bk->rhead, block_ht_params);
+		list_del_init(&bk->lru_head);
 		put_block(bk);
 	}
 }
