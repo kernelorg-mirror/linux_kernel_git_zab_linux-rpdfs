@@ -67,6 +67,7 @@ static void rpdfs_net_tcp_send_work_fn(struct work_struct *work)
 	struct msghdr msg;
 	int ret;
 
+	smp_rmb(); /* pairing with wmb as tsends are added */
 	llnode = llist_del_all(&tpriv->send_llhead);
 	if (llnode)
 		llist_reverse_add_tail(tsend, llnode, llnode, &tpriv->send_list, head);
@@ -409,6 +410,7 @@ static void rpdfs_net_tcp_send(struct rpdfs_fs_info *rfi, void *info, void *priv
 	rpdfs_prd("tsend %p queueing t %u cs %u ds %u",
 		tsend, tsend->hdr.type, tsend->hdr.ctl_size, le16_to_cpu(tsend->hdr.data_size));
 
+	smp_wmb(); /* tsend initialized before visible in llist */
 	llist_add(&tsend->llnode, &tpriv->send_llhead);
 	queue_work(ntinf->workq, &tpriv->send_work);
 }
