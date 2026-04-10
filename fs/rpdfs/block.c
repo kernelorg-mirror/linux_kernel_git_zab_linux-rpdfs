@@ -19,6 +19,7 @@
 #include "place.h"
 #include "pr.h"
 #include "rht.h"
+#include "rpdfs_trace.h"
 #include "seqlock.h"
 
 /*
@@ -178,9 +179,48 @@ struct rpdfs_block {
 	u8 write_confirm_mode;
 };
 
+/*
+ * While blocks are in the hash table and lru they have a huge value
+ * added to the refcount.  Lookup returns new references to blocks as
+ * long as this value is here.  The exclusive right to remove from the
+ * cache is only allowed by atomically removing this value and adding a
+ * normal refcount.
+ */
+#define REMOVAL_REFCOUNT (S64_MAX ^ (S64_MAX >> 1))
+
 enum {
 	RPDFS_BLOCK_BIT_ACCESSED = 0,
 };
+
+static void fill_params(struct rpdfs_trace_block_params *p, struct rpdfs_block *bk)
+{
+	p->place = bk->hnd.place;
+	p->bnr = bk->hnd.bnr;
+	p->alloc_ctr = bk->hnd.alloc_ctr;
+	p->write_ctr = bk->hnd.wcount;
+	p->refcount = atomic64_read(&(bk)->refcount) & ~REMOVAL_REFCOUNT;
+	p->dirty_seq = bk->dirty_seq;
+	p->flags = ((atomic64_read(&(bk)->refcount) & REMOVAL_REFCOUNT) ?
+			RPDFS_BLOCK_TRACE_FLAG_REMOVAL : 0) |
+		   (test_bit(RPDFS_BLOCK_BIT_ACCESSED, &bk->bits) ?
+			RPDFS_BLOCK_TRACE_FLAG_ACCESSED:0) |
+		   (bk->dirty ? RPDFS_BLOCK_TRACE_FLAG_DIRTY : 0) |
+		   (bk->upd_meta ? RPDFS_BLOCK_TRACE_FLAG_UPD_META : 0) |
+		   (bk->upd_data ? RPDFS_BLOCK_TRACE_FLAG_UPD_DATA : 0) |
+		   (bk->writer ? RPDFS_BLOCK_TRACE_FLAG_WRITER : 0);
+	p->dirty_list_nr = bk->dirty_list_nr;
+	p->request = bk->request_mode;
+	p->grant = bk->grant_mode;
+	p->confirm = bk->confirm_mode;
+	p->write_confirm = bk->write_confirm_mode;
+}
+
+/* call the tracepoint with the given args after translating bk fields into params */
+#define _TBP(tp, rfi, bk) \
+do { \
+	struct rpdfs_trace_block_params p__; \
+	tp((rfi), ({ fill_params(&p__, (bk)); &p__; })); \
+} while (0)
 
 #define bitfield_char(f, c) ((f) ? c : '-')
 #define RBF \
@@ -358,21 +398,15 @@ static void free_block(struct rpdfs_block *bk)
 	kfree_rcu(bk, rcu);
 }
 
-/*
- * While blocks are in the hash table and lru they have a huge value
- * added to the refcount.  Lookup returns new references to blocks as
- * long as this value is here.  The exclusive right to remove from the
- * cache is only allowed by atomically removing this value and adding a
- * normal refcount.
- */
-#define REMOVAL_REFCOUNT (S64_MAX ^ (S64_MAX >> 1))
 
-static void put_block(struct rpdfs_block *bk)
+static void put_block(struct rpdfs_fs_info *rfi, struct rpdfs_block *bk)
 {
 	s64 now;
 
-	if (!IS_ERR_OR_NULL(bk) && (now = atomic64_dec_return(&bk->refcount)) == 0)
+	if (!IS_ERR_OR_NULL(bk) && (now = atomic64_dec_return(&bk->refcount)) == 0) {
+		_TBP(trace_rpdfs_block_put_freed, rfi, bk);
 		free_block(bk);
+	}
 
 	WARN_ON_ONCE(now < 0);
 	WARN_ON_ONCE(now == REMOVAL_REFCOUNT - 1);
@@ -437,12 +471,13 @@ static bool get_block_removal(struct rpdfs_block *bk, u64 refs)
  * only refcount, then get the removal ref and remove the block from the
  * hash and lru.
  */
-static void try_remove_none(struct rpdfs_block_info *binf, struct rpdfs_block *bk)
+static void try_remove_none(struct rpdfs_fs_info *rfi, struct rpdfs_block_info *binf,
+			    struct rpdfs_block *bk)
 {
 	if (block_is_none(bk) && get_block_removal(bk, 1)) {
 		rhashtable_remove_fast(&binf->block_ht, &bk->rhead, block_ht_params);
 		list_lru_del_obj(&binf->lru, &bk->lru_head);
-		put_block(bk);
+		put_block(rfi, bk);
 	}
 }
 
@@ -529,7 +564,8 @@ out:
  * Returns the block with a refcount if found or allocated, or
  * ERR_PTR(-errno) on error.
  */
-static struct rpdfs_block *lookup_or_alloc_block(struct rpdfs_block_info *binf, u64 bnr,
+static struct rpdfs_block *lookup_or_alloc_block(struct rpdfs_fs_info *rfi,
+						 struct rpdfs_block_info *binf, u64 bnr,
 						 bool with_page, gfp_t gfp)
 {
 	struct rpdfs_block *found;
@@ -564,6 +600,8 @@ static struct rpdfs_block *lookup_or_alloc_block(struct rpdfs_block_info *binf, 
 			atomic64_set(&bk->refcount, 0);
 			free_block(bk);
 			bk = found;
+		} else {
+			_TBP(trace_rpdfs_block_inserted, rfi, bk);
 		}
 	}
 out:
@@ -695,6 +733,7 @@ static int try_send_confirm(struct rpdfs_fs_info *rfi, struct rpdfs_block *bk)
 		ret = send_block_cache_mode(rfi, bk->hnd.bnr, RPDFS_MSG_BLOCK_CONFIRM_MODE,
 					    bk->confirm_mode, GFP_NOWAIT);
 		if (ret == 0) {
+			_TBP(trace_rpdfs_block_send_confirm, rfi, bk);
 			bk->grant_mode = bk->confirm_mode;
 			if (bk->grant_mode == RPDFS_CACHE_MODE_NONE) {
 				bk->hnd.alloc_ctr = 0;
@@ -703,8 +742,8 @@ static int try_send_confirm(struct rpdfs_fs_info *rfi, struct rpdfs_block *bk)
 				bk->upd_data = 0;
 			}
 			bk->confirm_mode = RPDFS_CACHE_MODE_NULL;
-			put_block(bk);
-			try_remove_none(binf, bk);
+			put_block(rfi, bk);
+			try_remove_none(rfi, binf, bk);
 		}
 	}
 
@@ -817,7 +856,8 @@ static void dirty_boundary_covers(struct rpdfs_block *a, struct rpdfs_block *b)
  * Returns a non-zero count of the size of the dirty list when it
  * dirties.
  */
-static unsigned long make_dirty(struct rpdfs_block_info *binf, struct rpdfs_block *bk)
+static unsigned long make_dirty(struct rpdfs_fs_info *rfi, struct rpdfs_block_info *binf,
+				struct rpdfs_block *bk)
 {
 	unsigned int nr = get_dlist_nr(raw_smp_processor_id());
 	struct rpdfs_dirty_list *dlist;
@@ -846,6 +886,7 @@ static unsigned long make_dirty(struct rpdfs_block_info *binf, struct rpdfs_bloc
 		write_seqcount_end(&dlist->seqlock.seqcount);
 		spin_unlock(&dlist->seqlock.lock);
 
+		_TBP(trace_rpdfs_block_dirty, rfi, bk);
 		write_sequnlock(&bk->seqlock);
 	}
 
@@ -884,13 +925,14 @@ static void make_clean(struct rpdfs_fs_info *rfi, struct rpdfs_block_info *binf,
 	list_del_init(&bk->dirty_head);
 
 	ret = try_send_confirm(rfi, bk);
+	_TBP(trace_rpdfs_block_clean, rfi, bk);
 	write_sequnlock(&bk->seqlock);
 
 	if (preloaded)
 		rpdfs_net_preload_end(rfi);
 
 	wake_up_all(&bk->waitq);
-	put_block(bk);
+	put_block(rfi, bk);
 
 	/* like send failure in _block_release */
 	BUG_ON(ret < 0);
@@ -974,6 +1016,7 @@ static void rpdfs_block_write_work_fn(struct work_struct *work)
 		} else {
 			mode = RPDFS_CACHE_MODE_NULL;
 		}
+		_TBP(trace_rpdfs_block_send_write, rfi, bk);
 		write_sequnlock(&bk->seqlock);
 
 		ret = send_block_write(rfi, bk, mode, GFP_NOFS);
@@ -1202,14 +1245,14 @@ static void queue_block_flush(struct rpdfs_block_info *binf, struct rpdfs_block 
  * boundaries cover each other.  Or record that we're the first dirty
  * block in the txn.
  */
-static void dirty_in_txn(struct rpdfs_block_info *binf, struct rpdfs_transaction *txn,
-			 struct rpdfs_block *bk)
+static void dirty_in_txn(struct rpdfs_fs_info *rfi, struct rpdfs_block_info *binf,
+			 struct rpdfs_transaction *txn, struct rpdfs_block *bk)
 {
 	struct rpdfs_dirty_boundary bnd;
 	struct rpdfs_block *other;
 	bool flush = false;
 
-	if (make_dirty(binf, bk) > DIRTY_BLOCK_LIMIT)
+	if (make_dirty(rfi, binf, bk) > DIRTY_BLOCK_LIMIT)
 		flush = true;
 
 	if (txn->dirty_bnr) {
@@ -1217,7 +1260,7 @@ static void dirty_in_txn(struct rpdfs_block_info *binf, struct rpdfs_transaction
 		if (other) {
 			dirty_boundary_covers(bk, other);
 			dirty_boundary_covers(other, bk);
-			put_block(other);
+			put_block(rfi, other);
 		}
 	} else {
 		txn->dirty_bnr = bk->hnd.bnr;
@@ -1344,7 +1387,7 @@ int rpdfs_block_acquire(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn
 		if (!bk)
 			bk = ERR_PTR(-ENODATA);
 	} else {
-		bk = lookup_or_alloc_block(binf, bnr, true, GFP_NOFS);
+		bk = lookup_or_alloc_block(rfi, binf, bnr, true, GFP_NOFS);
 	}
 	if (IS_ERR(bk)) {
 		ret = PTR_ERR(bk);
@@ -1397,7 +1440,7 @@ int rpdfs_block_acquire(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn
 
 		if (ret == CAN_ACQUIRE) {
 			if (rbaf & RBAF_WRITE)
-				dirty_in_txn(binf, txn, bk);
+				dirty_in_txn(rfi, binf, txn, bk);
 			ret = 0;
 			break;
 		}
@@ -1412,7 +1455,7 @@ int rpdfs_block_acquire(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn
 	}
 out:
 	if (ret < 0)
-		put_block(bk);
+		put_block(rfi, bk);
 	rpdfs_prd_rfi(rfi, "bnr %llu rbaf %x ret %d", bnr, rbaf, ret);
 	return ret;
 }
@@ -1460,7 +1503,7 @@ void rpdfs_block_release(struct rpdfs_fs_info *rfi, struct rpdfs_block_handle **
 		queue_block_flush(binf, bk);
 
 	wake_up_all(&bk->waitq);
-	put_block(bk);
+	put_block(rfi, bk);
 
 	/*
 	 * This failure is not a failure to release, it's a failure to
@@ -1485,7 +1528,7 @@ bool rpdfs_block_is_dirty(struct rpdfs_fs_info *rfi, u64 bnr)
 	if (bk) {
 		while_read_seqretry(&bk->seqlock)
 			dirty = bk->dirty;
-		put_block(bk);
+		put_block(rfi, bk);
 	} else {
 		dirty = false;
 	}
@@ -1551,7 +1594,7 @@ int rpdfs_block_flush(struct rpdfs_fs_info *rfi, u64 bnr, bool wait)
 		if (dirty)
 			bnd = bk->dirty_bnd;
 	}
-	put_block(bk);
+	put_block(rfi, bk);
 
 	if (dirty)
 		ret = flush_and_wait(binf, &bnd, wait);
@@ -1659,7 +1702,7 @@ static int recv_block_read_result(struct rpdfs_fs_info *rfi, struct rpdfs_net_me
 			bk->grant_mode = rr->grant_mode;
 			if (bk->request_mode <= rr->grant_mode) {
 				bk->request_mode = RPDFS_CACHE_MODE_NULL;
-				put_block(bk);
+				put_block(rfi, bk);
 			}
 		}
 
@@ -1668,7 +1711,7 @@ static int recv_block_read_result(struct rpdfs_fs_info *rfi, struct rpdfs_net_me
 	write_sequnlock(&bk->seqlock);
 
 	wake_up_all(&bk->waitq);
-	put_block(bk);
+	put_block(rfi, bk);
 out:
 	return ret;
 }
@@ -1703,11 +1746,11 @@ static int recv_block_write_result(struct rpdfs_fs_info *rfi, struct rpdfs_net_m
 		}
 		if (bk->write_confirm_mode == bk->confirm_mode) {
 			bk->confirm_mode = RPDFS_CACHE_MODE_NULL;
-			put_block(bk);
+			put_block(rfi, bk);
 		}
 		bk->write_confirm_mode = RPDFS_CACHE_MODE_NULL;
 
-		try_remove_none(binf, bk);
+		try_remove_none(rfi, binf, bk);
 	}
 	write_sequnlock(&bk->seqlock);
 
@@ -1715,7 +1758,7 @@ static int recv_block_write_result(struct rpdfs_fs_info *rfi, struct rpdfs_net_m
 
 	try_complete_write(rfi, binf, bk->wri);
 put:
-	put_block(bk);
+	put_block(rfi, bk);
 out:
 	return ret;
 }
@@ -1756,13 +1799,13 @@ static int recv_block_grant_mode(struct rpdfs_fs_info *rfi, struct rpdfs_net_mes
 		bk->grant_mode = cm->mode;
 		if (bk->request_mode <= cm->mode) {
 			bk->request_mode = RPDFS_CACHE_MODE_NULL;
-			put_block(bk);
+			put_block(rfi, bk);
 		}
 		ret = 0;
 	}
 	write_sequnlock(&bk->seqlock);
 	wake_up_all(&bk->waitq);
-	put_block(bk);
+	put_block(rfi, bk);
 out:
 	return ret;
 }
@@ -1798,6 +1841,8 @@ static int recv_block_revoke_mode(struct rpdfs_fs_info *rfi, struct rpdfs_net_me
 		/* no block, we shrank, send immediate confirmation */
 		ret = send_block_cache_mode(rfi, bnr, RPDFS_MSG_BLOCK_CONFIRM_MODE,
 					    cm->mode, GFP_NOFS);
+		if (ret == 0)
+			trace_rpdfs_block_send_uncached_confirm(rfi, bnr, cm->mode);
 		goto out;
 	}
 
@@ -1821,7 +1866,7 @@ static int recv_block_revoke_mode(struct rpdfs_fs_info *rfi, struct rpdfs_net_me
 
 	if (ret == 0)
 		wake_up_all(&bk->waitq);
-	put_block(bk);
+	put_block(rfi, bk);
 out:
 	return ret;
 }
@@ -1886,7 +1931,7 @@ static int recv_free_stripe_grant(struct rpdfs_fs_info *rfi, struct rpdfs_net_me
 	     b++, i++) {
 		bnr = grant_bnr + (b * stripes);
 
-		bk = lookup_or_alloc_block(binf, bnr, false, GFP_NOFS);
+		bk = lookup_or_alloc_block(rfi, binf, bnr, false, GFP_NOFS);
 		if (IS_ERR(bk)) {
 			ret = PTR_ERR(bk);
 			goto out;
@@ -1902,7 +1947,7 @@ static int recv_free_stripe_grant(struct rpdfs_fs_info *rfi, struct rpdfs_net_me
 
 		/* most will be newly allocated and idle, but might have request waiters */
 		wake_up_all(&bk->waitq);
-		put_block(bk);
+		put_block(rfi, bk);
 	}
 
 	bnr = grant_bnr - this_stripe;
@@ -1976,7 +2021,8 @@ static unsigned long rpdfs_block_count_objects(struct shrinker *shrinker,
 }
 
 /* The caller acquired the removal ref while moving off the lru. */
-static void remove_isolated_list(struct rpdfs_block_info *binf, struct list_head *isolated)
+static void remove_isolated_list(struct rpdfs_fs_info *rfi, struct rpdfs_block_info *binf,
+				 struct list_head *isolated)
 {
 	struct rpdfs_block *bk;
 	struct rpdfs_block *bk__;
@@ -1984,7 +2030,7 @@ static void remove_isolated_list(struct rpdfs_block_info *binf, struct list_head
 	list_for_each_entry_safe(bk, bk__, isolated, lru_head) {
 		rhashtable_remove_fast(&binf->block_ht, &bk->rhead, block_ht_params);
 		list_del_init(&bk->lru_head);
-		put_block(bk);
+		put_block(rfi, bk);
 	}
 }
 
@@ -1995,7 +2041,7 @@ static unsigned long rpdfs_block_scan_objects(struct shrinker *shrinker, struct 
 	unsigned long freed;
 
 	freed = list_lru_shrink_walk(&binf->lru, sc, scoutfs_block_isolate, &isolated);
-	remove_isolated_list(binf, &isolated);
+	remove_isolated_list(binf->rfi, binf, &isolated);
 	return freed;
 }
 
@@ -2145,23 +2191,24 @@ static void free_and_destroy_block(void *ptr, void *arg)
 {
 	struct rpdfs_block *bk = ptr;
 	struct rpdfs_block_info *binf = arg;
+	struct rpdfs_fs_info *rfi = binf->rfi;
 
 	if (bk->request_mode)
-		put_block(bk);
+		put_block(rfi, bk);
 	if (bk->confirm_mode)
-		put_block(bk);
+		put_block(rfi, bk);
 
 	/* this can pull off of dirty lists, the flusher, or distributed writes */
 	if (bk->dirty) {
 		bk->dirty = 0;
 		if (!list_empty(&bk->dirty_head))
 			list_del_init(&bk->dirty_head);
-		put_block(bk);
+		put_block(rfi, bk);
 	}
 
 	if (get_block_removal(bk, 0)) {
 		list_lru_del_obj(&binf->lru, &bk->lru_head);
-		put_block(bk);
+		put_block(rfi, bk);
 	}
 }
 
