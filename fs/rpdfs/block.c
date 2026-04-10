@@ -683,8 +683,7 @@ static int send_free_stripe_request(struct rpdfs_fs_info *rfi, u64 bnr, u64 flag
  * revocation.  We can't have active users that conflict with the mode.
  * If we sent a confirm mode with a flushing write then we have to wait
  * for its result to know if the server applied it and if we need to
- * resend its mode if it failed, or possibly send a further lesser
- * confirmation.
+ * resend its mode if it failed.
  */
 static int try_send_confirm(struct rpdfs_fs_info *rfi, struct rpdfs_block *bk)
 {
@@ -856,10 +855,17 @@ static unsigned long make_dirty(struct rpdfs_block_info *binf, struct rpdfs_bloc
 /*
  * The block's dirty_head is on the caller's private dist_write at this
  * point.
+ *
+ * The block being dirty could have been the last thing preventing
+ * sending a confirmation.  As we clean we need to try and send the
+ * confirmation of the revoke mode.
  */
-static void make_clean(struct rpdfs_block_info *binf, struct rpdfs_block *bk)
+static void make_clean(struct rpdfs_fs_info *rfi, struct rpdfs_block_info *binf,
+		       struct rpdfs_block *bk)
 {
 	struct rpdfs_dirty_list *dlist;
+	bool preloaded;
+	int ret;
 
 	BUG_ON(!bk->dirty);
 	BUG_ON(list_empty(&bk->dirty_head));
@@ -869,15 +875,25 @@ static void make_clean(struct rpdfs_block_info *binf, struct rpdfs_block *bk)
 	dlist->count--;
 	write_sequnlock(&dlist->seqlock);
 
+	preloaded = rpdfs_net_preload(rfi, GFP_NOFS) == 0;
+
 	write_seqlock(&bk->seqlock);
 	bk->dirty = 0;
 	bk->dirty_seq = 0;
 	bk->dirty_list_nr = 0;
 	list_del_init(&bk->dirty_head);
+
+	ret = try_send_confirm(rfi, bk);
 	write_sequnlock(&bk->seqlock);
+
+	if (preloaded)
+		rpdfs_net_preload_end(rfi);
 
 	wake_up_all(&bk->waitq);
 	put_block(bk);
+
+	/* like send failure in _block_release */
+	BUG_ON(ret < 0);
 }
 
 /*
@@ -885,7 +901,8 @@ static void make_clean(struct rpdfs_block_info *binf, struct rpdfs_block *bk)
  * the write finished then walk the busy writes and complete them in
  * order as they complete.
  */
-static void try_complete_write(struct rpdfs_block_info *binf, struct rpdfs_dist_write *wri)
+static void try_complete_write(struct rpdfs_fs_info *rfi, struct rpdfs_block_info *binf,
+			       struct rpdfs_dist_write *wri)
 {
 	struct rpdfs_flusher *flshr = binf->flshr;
 	struct rpdfs_block *bk;
@@ -915,7 +932,7 @@ static void try_complete_write(struct rpdfs_block_info *binf, struct rpdfs_dist_
 
 		list_for_each_entry_safe(bk, bk__, &wri->dirty_list, dirty_head) {
 			bk->wri = NULL;
-			make_clean(binf, bk);
+			make_clean(rfi, binf, bk);
 			bk = NULL; /* making clean put the refcount we were using */
 		}
 
@@ -964,7 +981,7 @@ static void rpdfs_block_write_work_fn(struct work_struct *work)
 	}
 
 	/* drop our temp elevation, potentially completing the write */
-	try_complete_write(binf, wri);
+	try_complete_write(rfi, binf, wri);
 }
 
 static struct rpdfs_block *first_within_boundary(struct list_head *list,
@@ -1415,16 +1432,17 @@ void rpdfs_block_release(struct rpdfs_fs_info *rfi, struct rpdfs_block_handle **
 	struct rpdfs_block_info *binf = RPDFS_BINF(rfi);
 	struct rpdfs_block *bk;
 	bool flush = false;
-	int send_ret;
+	bool preloaded;
+	int ret;
 
 	if (*hnd == NULL)
 		return;
 	bk = container_of(*hnd, struct rpdfs_block, hnd);
 	*hnd = NULL;
 
-	send_ret = rpdfs_net_preload(rfi, GFP_NOFS);
-	write_seqlock(&bk->seqlock);
+	preloaded = rpdfs_net_preload(rfi, GFP_NOFS) == 0;
 
+	write_seqlock(&bk->seqlock);
 	/* XXX not great that we're presuming the intent of the release :/ */
 	if (bk->writer) {
 		bk->writer = 0;
@@ -1433,14 +1451,11 @@ void rpdfs_block_release(struct rpdfs_fs_info *rfi, struct rpdfs_block_handle **
 	} else {
 		bk->readers--;
 	}
-
-	if (send_ret == 0) {
-		send_ret = try_send_confirm(rfi, bk);
-		rpdfs_net_preload_end(rfi);
-	}
-
+	ret = try_send_confirm(rfi, bk);
 	write_sequnlock(&bk->seqlock);
 
+	if (preloaded)
+		rpdfs_net_preload_end(rfi);
 	if (flush)
 		queue_block_flush(binf, bk);
 
@@ -1452,7 +1467,7 @@ void rpdfs_block_release(struct rpdfs_fs_info *rfi, struct rpdfs_block_handle **
 	 * participate in the cache coherency protocol.  We'd go
 	 * read-only, abort, etc.
 	 */
-	BUG_ON(send_ret < 0);
+	BUG_ON(ret < 0);
 }
 
 /*
@@ -1692,15 +1707,13 @@ static int recv_block_write_result(struct rpdfs_fs_info *rfi, struct rpdfs_net_m
 		}
 		bk->write_confirm_mode = RPDFS_CACHE_MODE_NULL;
 
-		/* can have to send second lesser confirm */
-		ret = try_send_confirm(rfi, bk);
 		try_remove_none(binf, bk);
 	}
 	write_sequnlock(&bk->seqlock);
 
 	rpdfs_net_preload_end(rfi);
 
-	try_complete_write(binf, bk->wri);
+	try_complete_write(rfi, binf, bk->wri);
 put:
 	put_block(bk);
 out:
@@ -1756,18 +1769,18 @@ out:
 
 /*
  * Revocations are only received for previously granted modes.  They
- * should only decrease our granted mode.  We can receive back to back
- * revocations of decreasing modes (write->read, read->none).
+ * should only decrease our granted mode.  We will only receive one
+ * revoke mode at a time.
  *
  * However, we can free clean blocks under memory pressure.  Then we can
- * allocate a new block that a caller's trying to acquire.  We can
- * receive revocations for the old block number that was freed at any
- * point in that life cycle.  We need to be forgiving of the state of
- * blocks when we receive a revocation.
+ * allocate a new block that is being acquired.  We can receive a revoke
+ * for the old block number that was freed at any point in that life
+ * cycle.  We need to be forgiving of the state of blocks when we
+ * receive a revocation.
  *
  * We must send a confirmation for every revoke we receive, and we have
  * to wait until users of the revoked mode (including dirty blocks) have
- * finished.  We record that we need to confirm the mode, and this
+ * finished.  We record that we need to confirm the mode and this
  * pending confirmation stops future incompatible users.
  */
 static int recv_block_revoke_mode(struct rpdfs_fs_info *rfi, struct rpdfs_net_message_desc *md)
@@ -1776,6 +1789,7 @@ static int recv_block_revoke_mode(struct rpdfs_fs_info *rfi, struct rpdfs_net_me
 	struct rpdfs_msg_cache_mode *cm = md->ctl_buf;
 	u64 bnr = le64_to_cpu(cm->bnr);
 	struct rpdfs_block *bk;
+	bool preloaded;
 	bool flush;
 	int ret;
 
@@ -1783,30 +1797,30 @@ static int recv_block_revoke_mode(struct rpdfs_fs_info *rfi, struct rpdfs_net_me
 	if (!bk) {
 		/* no block, we shrank, send immediate confirmation */
 		ret = send_block_cache_mode(rfi, bnr, RPDFS_MSG_BLOCK_CONFIRM_MODE,
-					    RPDFS_CACHE_MODE_NONE, GFP_NOFS);
+					    cm->mode, GFP_NOFS);
 		goto out;
 	}
 
-	ret = rpdfs_net_preload(rfi, GFP_NOFS);
-	if (ret < 0)
-		goto put;
+	preloaded = rpdfs_net_preload(rfi, GFP_NOFS) == 0;
 
 	write_seqlock(&bk->seqlock);
-	if (!bk->confirm_mode)
+	if (!bk->confirm_mode) {
 		get_block(bk);
-	bk->confirm_mode = cm->mode;
-	flush = bk->dirty;
-	ret = try_send_confirm(rfi, bk);
+		bk->confirm_mode = cm->mode;
+		flush = bk->dirty;
+		ret = try_send_confirm(rfi, bk);
+	} else {
+		ret = -EPROTO;
+	}
 	write_sequnlock(&bk->seqlock);
 
-	rpdfs_net_preload_end(rfi);
-
+	if (preloaded)
+		rpdfs_net_preload_end(rfi);
 	if (flush)
 		queue_block_flush(binf, bk);
 
 	if (ret == 0)
 		wake_up_all(&bk->waitq);
-put:
 	put_block(bk);
 out:
 	return ret;
