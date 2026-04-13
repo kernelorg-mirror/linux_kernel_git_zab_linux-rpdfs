@@ -13,11 +13,16 @@
 #include "pr.h"
 #include "super.h"
 
+struct rpdfs_net_pcpu_pfrag {
+	struct page_frag_cache cache;
+	void *preloaded;
+	bool have_cache;
+};
+
 struct rpdfs_net_info {
 	struct rhashtable conn_ht;
 	struct workqueue_struct *workq;
-	void * __percpu *preloaded_pfrag;
-	struct page_frag_cache pfrag_cache;
+	struct rpdfs_net_pcpu_pfrag __percpu *pcpu_pfrag;
 	const struct rpdfs_net_transport_ops *ops;
 	void *ops_info;
 	rpdfs_net_recv_fn_t recv_fns[RPDFS_MSG__NR];
@@ -137,6 +142,29 @@ static void rpdfs_net_shutdown_work_fn(struct work_struct *work)
 }
 
 /*
+ * Give the caller exclusive access to a pfrag cache.
+ */
+static void borrow_pfrag_cache(struct rpdfs_net_pcpu_pfrag *pcpf, struct page_frag_cache *cache)
+{
+	if (!pcpf->have_cache)
+		page_frag_cache_init(&pcpf->cache);
+	else
+		pcpf->have_cache = false;
+
+	*cache = pcpf->cache;
+}
+
+static void return_pfrag_cache(struct rpdfs_net_pcpu_pfrag *pcpf, struct page_frag_cache *cache)
+{
+	if (!pcpf->have_cache) {
+		pcpf->cache = *cache;
+		pcpf->have_cache = true;
+	} else {
+		page_frag_cache_drain(cache);
+	}
+}
+
+/*
  * If this returns 0 then pre-emption has been disabled and the next
  * _send() will have sufficient resources to not block.  It can still
  * return errors.  The caller must call _preload_end() to re-enable
@@ -145,35 +173,39 @@ static void rpdfs_net_shutdown_work_fn(struct work_struct *work)
 int rpdfs_net_preload(struct rpdfs_fs_info *rfi, gfp_t gfp)
 {
 	struct rpdfs_net_info *ninf = RPDFS_NINF(rfi);
+	struct rpdfs_net_pcpu_pfrag *pcpf;
+	struct page_frag_cache cache;
 	void *pfrag;
-	void **pre;
 	int ret;
 
 	WARN_ON_ONCE(!gfpflags_allow_blocking(gfp));
 
-	pre = get_cpu_ptr(ninf->preloaded_pfrag);
-	if (*pre) {
+	pcpf = get_cpu_ptr(ninf->pcpu_pfrag);
+	if (pcpf->preloaded) {
 		ret = 0;
 		goto out;
 	}
 
-	put_cpu_ptr(ninf->preloaded_pfrag);
+	borrow_pfrag_cache(pcpf, &cache);
+	put_cpu_ptr(ninf->pcpu_pfrag);
 
 	/* preload->use can cross cgroups, don't account */
-	pfrag = page_frag_alloc_align(&ninf->pfrag_cache, ninf->ops->send_pfrag_head +
+	pfrag = page_frag_alloc_align(&cache, ninf->ops->send_pfrag_head +
 				      sizeof(struct rpdfs_msg_header) + RPDFS_MSG_MAX_CTL_SIZE,
 				      gfp & ~__GFP_ACCOUNT, ARCH_KMALLOC_MINALIGN);
-	if (!pfrag) {
-		ret = -ENOMEM;
-		goto out;
-	}
 
-	pre = get_cpu_ptr(ninf->preloaded_pfrag);
-	if (*pre == NULL)
-		*pre = pfrag;
-	else
-		page_frag_free(pfrag);
-	ret = 0;
+	pcpf = get_cpu_ptr(ninf->pcpu_pfrag);
+	return_pfrag_cache(pcpf, &cache);
+	if (pfrag) {
+		if (pcpf->preloaded == NULL)
+			pcpf->preloaded = pfrag;
+		else
+			page_frag_free(pfrag);
+		ret = 0;
+	} else {
+		ret = -ENOMEM;
+		put_cpu_ptr(ninf->pcpu_pfrag);
+	}
 out:
 	return ret;
 }
@@ -182,7 +214,7 @@ void rpdfs_net_preload_end(struct rpdfs_fs_info *rfi)
 {
 	struct rpdfs_net_info *ninf = RPDFS_NINF(rfi);
 
-	put_cpu_ptr(ninf->preloaded_pfrag);
+	put_cpu_ptr(ninf->pcpu_pfrag);
 }
 
 /*
@@ -192,24 +224,29 @@ void rpdfs_net_preload_end(struct rpdfs_fs_info *rfi)
  */
 static void *alloc_pfrag_preloaded(struct rpdfs_net_info *ninf, unsigned int size, gfp_t gfp)
 {
+	struct rpdfs_net_pcpu_pfrag *pcpf;
+	struct page_frag_cache cache;
+	bool try_preloaded = false;
 	void *pfrag;
-	void **pre;
 
-	if (!gfpflags_allow_blocking(gfp) && !in_interrupt()) {
-		pfrag = page_frag_alloc_align(&ninf->pfrag_cache, size, gfp | __GFP_NOWARN,
-					      ARCH_KMALLOC_MINALIGN);
-		if (!pfrag) {
-			pre = get_cpu_ptr(ninf->preloaded_pfrag);
-			if (*pre) {
-				pfrag = *pre;
-				*pre = NULL;
-				kmemleak_update_trace(pfrag);
-			}
-			put_cpu_ptr(ninf->preloaded_pfrag);
-		}
-	} else {
-		pfrag = page_frag_alloc_align(&ninf->pfrag_cache, size, gfp, ARCH_KMALLOC_MINALIGN);
+	try_preloaded = !gfpflags_allow_blocking(gfp) && !in_interrupt();
+	if (try_preloaded)
+		gfp |= __GFP_NOWARN;
+
+	pcpf = get_cpu_ptr(ninf->pcpu_pfrag);
+	borrow_pfrag_cache(pcpf, &cache);
+	put_cpu_ptr(ninf->pcpu_pfrag);
+
+	pfrag = page_frag_alloc_align(&cache, size, gfp | __GFP_NOWARN, ARCH_KMALLOC_MINALIGN);
+
+	pcpf = get_cpu_ptr(ninf->pcpu_pfrag);
+	return_pfrag_cache(pcpf, &cache);
+	if (!pfrag && try_preloaded && pcpf->preloaded) {
+		pfrag = pcpf->preloaded;
+		pcpf->preloaded = NULL;
+		kmemleak_update_trace(pfrag);
 	}
+	put_cpu_ptr(ninf->pcpu_pfrag);
 
 	return pfrag;
 }
@@ -482,6 +519,8 @@ u8 rpdfs_net_err(int nerrno)
 int rpdfs_net_setup(struct rpdfs_fs_info *rfi, const struct rpdfs_net_transport_ops *ops)
 {
 	struct rpdfs_net_info *ninf = NULL;
+	struct rpdfs_net_pcpu_pfrag *pcpf;
+	int cpu;
 	int ret;
 
 	/* arbitrary, to limit pfrag preload of a max ctl_size to smaller than a page */
@@ -494,16 +533,21 @@ int rpdfs_net_setup(struct rpdfs_fs_info *rfi, const struct rpdfs_net_transport_
 	ninf = kzalloc(sizeof(struct rpdfs_net_info), GFP_NOFS);
 	if (ninf) {
 		ninf->workq = alloc_workqueue("rpdfs-net", WQ_MEM_RECLAIM, 0);
-		ninf->preloaded_pfrag = alloc_percpu(void *);
+		ninf->pcpu_pfrag = alloc_percpu(struct rpdfs_net_pcpu_pfrag);
 		ninf->ops_info = ops->setup(rfi);
 	}
-	if (!ninf || !ninf->workq || !ninf->preloaded_pfrag || !ninf->ops_info) {
+	if (!ninf || !ninf->workq || !ninf->pcpu_pfrag || !ninf->ops_info) {
 		ret = -ENOMEM;
 		goto out;
 	}
 
 	ninf->ops = ops;
-	page_frag_cache_init(&ninf->pfrag_cache);
+
+	for_each_possible_cpu(cpu) {
+		pcpf = per_cpu_ptr(ninf->pcpu_pfrag, cpu);
+		page_frag_cache_init(&pcpf->cache);
+		pcpf->have_cache = true;
+	}
 
 	ret = rhashtable_init(&ninf->conn_ht, &rpdfs_net_conn_ht_params);
 	if (ret < 0)
@@ -517,7 +561,7 @@ out:
 			destroy_workqueue(ninf->workq);
 		if (ninf->ops_info)
 			ops->destroy(rfi, ninf->ops_info);
-		free_percpu(ninf->preloaded_pfrag);
+		free_percpu(ninf->pcpu_pfrag);
 		kfree(ninf);
 	}
 	return ret;
@@ -548,7 +592,7 @@ static void queue_shutdown_all(struct rpdfs_fs_info *rfi, struct rpdfs_net_info 
 void rpdfs_net_destroy(struct rpdfs_fs_info *rfi)
 {
 	struct rpdfs_net_info *ninf = RPDFS_NINF(rfi);
-	void **pre;
+	struct rpdfs_net_pcpu_pfrag *pcpf;
 	int cpu;
 
 	if (ninf) {
@@ -558,12 +602,14 @@ void rpdfs_net_destroy(struct rpdfs_fs_info *rfi)
 		ninf->ops->destroy(rfi, ninf->ops_info);
 
 		for_each_possible_cpu(cpu) {
-			pre = per_cpu_ptr(ninf->preloaded_pfrag, cpu);
-			if (*pre)
-				page_frag_free(*pre);
+			pcpf = per_cpu_ptr(ninf->pcpu_pfrag, cpu);
+			if (pcpf->preloaded)
+				page_frag_free(pcpf->preloaded);
+			if (pcpf->have_cache)
+				page_frag_cache_drain(&pcpf->cache);
 		}
+		free_percpu(ninf->pcpu_pfrag);
 
-		page_frag_cache_drain(&ninf->pfrag_cache);
 		kfree(ninf);
 		SET_RPDFS_NINF(rfi, NULL);
 	}
