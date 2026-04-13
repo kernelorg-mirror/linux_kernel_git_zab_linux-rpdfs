@@ -312,7 +312,7 @@ struct inode *rpdfs_new_inode(struct super_block *sb, struct rpdfs_ino_gen *ig)
 
 	ret = insert_inode_locked4(inode, ig_hashval(ig), rpdfs_iget_test, ig);
 	if (ret < 0) {
-		discard_new_inode(inode);
+		iput(inode);
 		inode = ERR_PTR(ret);
 	}
 out:
