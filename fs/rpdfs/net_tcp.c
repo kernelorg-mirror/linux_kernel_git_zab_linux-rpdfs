@@ -88,8 +88,11 @@ static void rpdfs_net_tcp_send_work_fn(struct work_struct *work)
 		msg.msg_iter = tsend->iter;
 		ret = sock_sendmsg(tpriv->sock, &msg);
 		tsend->iter = msg.msg_iter;
-		if (ret < 0)
+		if (ret < 0) {
+			if (ret == -EAGAIN)
+				ret = 0;
 			break;
+		}
 
 		if (iov_iter_count(&tsend->iter) == 0) {
 			list_del_init(&tsend->head);
@@ -203,8 +206,11 @@ static void rpdfs_net_tcp_recv_work_fn(struct work_struct *work)
 		lock_sock(sk);
 		ret = tcp_read_sock(sk, &desc, rpdfs_net_tcp_read_actor);
 		release_sock(sk);
-		if (ret <= 0)
+		if (ret <= 0) {
+			if (ret == -EAGAIN)
+				ret = 0;
 			goto out;
+		}
 
 		/* incoming message complete, call recv */
 		if (iov_iter_count(&rx->iter) == 0 && rx->bvecs[0].bv_offset > 0) {
