@@ -1069,8 +1069,6 @@ static bool set_write_in_order(struct list_head *set_list, struct list_head *cle
 	list_for_each_entry_safe(bk, _bk_, clear_list, dirty_head) {
 		do {
 			write_seqlock(&bk->seqlock);
-			/* would be.. corruption error? but we don't have io errors wired up */
-			BUG_ON(bk->hnd.place == place);
 			ordered = bk->hnd.place > place;
 			writer = bk->writer;
 			if (ordered && !writer) {
