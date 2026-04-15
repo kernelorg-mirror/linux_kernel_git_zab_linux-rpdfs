@@ -403,13 +403,17 @@ static void put_block(struct rpdfs_fs_info *rfi, struct rpdfs_block *bk)
 {
 	s64 now;
 
-	if (!IS_ERR_OR_NULL(bk) && (now = atomic64_dec_return(&bk->refcount)) == 0) {
+	if (IS_ERR_OR_NULL(bk))
+		return;
+
+	now = atomic64_dec_return(&bk->refcount);
+	WARN_ON_ONCE(now < 0);
+	WARN_ON_ONCE(now == REMOVAL_REFCOUNT - 1);
+
+	if (now == 0) {
 		_TBP(trace_rpdfs_block_put_freed, rfi, bk);
 		free_block(bk);
 	}
-
-	WARN_ON_ONCE(now < 0);
-	WARN_ON_ONCE(now == REMOVAL_REFCOUNT - 1);
 }
 
 /*
@@ -1853,6 +1857,7 @@ static int recv_block_revoke_mode(struct rpdfs_fs_info *rfi, struct rpdfs_net_me
 		flush = bk->dirty;
 		ret = try_send_confirm(rfi, bk);
 	} else {
+		flush = false;
 		ret = -EPROTO;
 	}
 	write_sequnlock(&bk->seqlock);
