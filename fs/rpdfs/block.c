@@ -35,10 +35,10 @@
  * local writers can modify blocks.
  *
  * Local shared read or exclusive write handles to blocks are mutually
- * exclusive.  Handle acquisition attempts will block until incompatible
- * handles are released.  In this way, handles behave like locks.  But
- * they layer on the additional requirement that an acquisition has to
- * be allowed by the mode granted by the server.
+ * exclusive.  Handle acquisition attempts will block until the
+ * excluding handles are released.  In this way, handles behave like
+ * locks.  But they layer on the additional requirement that an
+ * acquisition has to be allowed by the mode granted by the server.
  *
  * The granted cache mode remains while there are no active handles.
  * From the network protocol's perspective, the cache mode is a level of
@@ -137,15 +137,16 @@ struct rpdfs_dist_write {
  * @request_mode is the mode that we've sent a request for, either with
  * a read or request_mode message.
  *
- * @grant_mode is the mode that new references must be compatible with.
- * It's set by the server as we receive read_result, grant_mode, or
- * free_stripe_grant messages.  It's decreased after receiving a
- * revocation, users drain, and we send a confirmation.
+ * @grant_mode is the highest mode that the protocol has given us
+ * permission to use.  It's set by the server as we receive read_result,
+ * grant_mode, or free_stripe_grant messages.  It's decreased after
+ * receiving a revocation, users drain, and we send a confirmation.
  *
- * @confirm_mode is the record of a confirm that we must send once
- * current users are compatible with the confirm mode.  It is set as we
- * receive a revoke_mode from the server, and cleared as incompatible
- * use finishes: releasing references or write completion.
+ * @confirm_mode is the record of the next more restrictive mode that
+ * will be granted by the server once current use that's relying on the
+ * granted mode completes.  It is set as we receive a revoke_mode from
+ * the server and is cleared as users depending on the granted mode
+ * complete: releasing handles or write completion.
  *
  * @write_confirm_mode is the record that a sent write message contains
  * a confirm_mode.  We don't know if it's been processed until we get a
@@ -287,9 +288,8 @@ static u8 readers_writer_mode(struct rpdfs_block *bk)
 }
 
 /*
- * Return the least compatible mode needed to be compatible with current
- * use of the cached block.  Includes held references and dirty modified
- * contents.
+ * Return the mode that must be granted for the current users of the
+ * block.  Includes acquired handles and dirty blocks.
  */
 static bool cache_using_mode(struct rpdfs_block *bk)
 {
@@ -312,16 +312,26 @@ static bool alloc_ctr_is_free(u64 alloc_ctr)
 }
 
 /*
- * Returns true if references of the two modes are compatible.  NULL and
- * NONE are compatible with everything.  The only incompatible
- * combinations are a write paired with a read or write.
+ * Returns true if handles of the given mode can be acquired
+ * concurrently.  They can't be concurrent if either is write except for
+ * the case where the other is null or none.
  */
-static bool modes_compatible(u8 low, u8 high)
+static bool handle_modes_concurrent(u8 low, u8 high)
 {
 	if (low > high)
 		swap(low, high);
 
 	return high < RPDFS_CACHE_MODE_WRITE || low < RPDFS_CACHE_MODE_READ;
+}
+
+/*
+ * Returns true if the mode is sufficient for operations with the use
+ * mode.  This is about being granted a sufficient mode from the
+ * protocol, not providing exclusion between two operations.
+ */
+static bool mode_sufficient_for(u8 mode, u8 use)
+{
+	return mode >= use;
 }
 
 /*
@@ -722,10 +732,10 @@ static int send_free_stripe_request(struct rpdfs_fs_info *rfi, u64 bnr, u64 flag
 
 /*
  * See if we can send an explicit confirmation of a previously received
- * revocation.  We can't have active users that conflict with the mode.
- * If we sent a confirm mode with a flushing write then we have to wait
- * for its result to know if the server applied it and if we need to
- * resend its mode if it failed.
+ * revocation.  We have to wait until the mode the revoke leaves is
+ * sufficient for active use of the block.  If we sent a confirm mode
+ * with a flushing write then we have to wait for its result to know if
+ * the server applied it and if we need to resend its mode if it failed.
  */
 static int try_send_confirm(struct rpdfs_fs_info *rfi, struct rpdfs_block *bk)
 {
@@ -733,7 +743,7 @@ static int try_send_confirm(struct rpdfs_fs_info *rfi, struct rpdfs_block *bk)
 	int ret = 0;
 
 	if (bk->confirm_mode && !bk->write_confirm_mode &&
-	    modes_compatible(cache_using_mode(bk), bk->confirm_mode)) {
+	    mode_sufficient_for(bk->confirm_mode, cache_using_mode(bk))) {
 		ret = send_block_cache_mode(rfi, bk->hnd.bnr, RPDFS_MSG_BLOCK_CONFIRM_MODE,
 					    bk->confirm_mode, GFP_NOWAIT);
 		if (ret == 0) {
@@ -1014,7 +1024,7 @@ static void rpdfs_block_write_work_fn(struct work_struct *work)
 		write_seqlock(&bk->seqlock);
 		/* flushing excludes writers, compat ignores dirty that's cleared by write */
 		if (bk->confirm_mode &&
-		    modes_compatible(readers_writer_mode(bk), bk->confirm_mode)) {
+		    mode_sufficient_for(bk->confirm_mode, readers_writer_mode(bk))) {
 			mode = bk->confirm_mode;
 			bk->write_confirm_mode = mode;
 		} else {
@@ -1316,7 +1326,8 @@ static int can_acquire(struct rpdfs_block_info *binf, struct rpdfs_block *bk, u8
 	}
 
 	/* don't have sufficient mode */
-	if ((mode > bk->grant_mode) || (bk->confirm_mode && mode > bk->confirm_mode)) {
+	if (!mode_sufficient_for(bk->grant_mode, mode) ||
+	    (bk->confirm_mode && !mode_sufficient_for(bk->confirm_mode, mode))) {
 		if (rbaf & RBAF_NONBLOCK_MODE)
 			ret = -EAGAIN;
 		else if (mode > bk->request_mode)
@@ -1335,8 +1346,8 @@ static int can_acquire(struct rpdfs_block_info *binf, struct rpdfs_block *bk, u8
 		goto out;
 	}
 
-	/* finally acquire if we're compatible with others, or wait for incompat to finish */
-	if (modes_compatible(readers_writer_mode(bk), mode))
+	/* finally acquire if concurrence is allowed with others */
+	if (handle_modes_concurrent(readers_writer_mode(bk), mode))
 		ret = CAN_ACQUIRE;
 	else
 		ret = 0;
@@ -1825,8 +1836,9 @@ out:
  *
  * We must send a confirmation for every revoke we receive, and we have
  * to wait until users of the revoked mode (including dirty blocks) have
- * finished.  We record that we need to confirm the mode and this
- * pending confirmation stops future incompatible users.
+ * finished.  New acquisitions are tested against the next mode so that
+ * we constant new acquisitions can't hold the revoked mode
+ * indefinitely.
  */
 static int recv_block_revoke_mode(struct rpdfs_fs_info *rfi, struct rpdfs_net_message_desc *md)
 {
