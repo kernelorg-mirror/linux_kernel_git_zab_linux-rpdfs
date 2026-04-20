@@ -21,6 +21,7 @@ rpdfs-y	:= balloc.o \
 	   net.o \
 	   net_tcp.o \
 	   parse.o \
+	   preq.o \
 	   rht.o \
 	   rpdfs_trace.o \
 	   super.o \

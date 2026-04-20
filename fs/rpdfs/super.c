@@ -71,6 +71,7 @@ static int rpdfs_set_super(struct super_block *sb, struct fs_context *fc)
 
 static void rpdfs_destroy(struct rpdfs_fs_info *rfi)
 {
+	rpdfs_preq_destroy(rfi);
 	rpdfs_balloc_destroy(rfi);
 	rpdfs_block_destroy(rfi);
 	rpdfs_map_destroy(rfi);
@@ -84,7 +85,8 @@ static int rpdfs_setup(struct rpdfs_fs_info *rfi)
 	ret = rpdfs_net_setup(rfi, &rpdfs_net_tcp_ops) ?:
 	      rpdfs_map_setup(rfi) ?:
 	      rpdfs_block_setup(rfi) ?:
-	      rpdfs_balloc_setup(rfi);
+	      rpdfs_balloc_setup(rfi) ?:
+	      rpdfs_preq_setup(rfi);
 	if (ret < 0)
 		rpdfs_destroy(rfi);
 
