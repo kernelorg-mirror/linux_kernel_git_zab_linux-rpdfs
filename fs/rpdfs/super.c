@@ -17,6 +17,7 @@
 #include "net_tcp.h"
 #include "parse.h"
 #include "pr.h"
+#include "preq.h"
 #include "rpdfs_trace.h"
 #include "xattr.h"
 
@@ -38,13 +39,40 @@ static int rpdfs_sync_fs(struct super_block *sb, int wait)
 	return 0;
 }
 
+/*
+ * The statfs block/file counts are based on the result of the
+ * block_counts parallel request which is cached for a while.
+ *
+ * The files count is a little wonky because we don't have independent
+ * allocation pools for blocks and inodes.  We count free blocks as free
+ * inodes so that you can see the total allocated inodes and can see how
+ * many inodes could be allocated before enospc.  But the total possible
+ * inodes shrinks as other blocks are allocated.
+ */
 static int rpdfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 {
+	struct rpdfs_fs_info *rfi = RPDFS_DENTRY_FS(dentry);
+	struct rpdfs_msg_block_counts_result bcr;
+	int ret;
+
+	ret = rpdfs_preq_block_counts(rfi, &bcr);
+	if (ret < 0)
+		goto out;
+
 	buf->f_type = RPDFS_SUPER_MAGIC;
 	buf->f_bsize = RPDFS_BLOCK_SIZE;
+	/* caller sets f_frsize if 0 to f_bsize */
+	buf->f_blocks = le64_to_cpu(bcr.total);
+	buf->f_bfree = buf->f_blocks - le64_to_cpu(bcr.allocated);
+	buf->f_bavail = buf->f_bfree;
+	buf->f_files = buf->f_bfree + le64_to_cpu(bcr.inodes);
+	buf->f_ffree = buf->f_bfree;
 	buf->f_namelen = RPDFS_NAME_MAX;
+	/* caller overwrites f_flags */
 
-	return 0;
+	ret = 0;
+out:
+	return ret;
 }
 
 static const struct super_operations rpdfs_sop = {
