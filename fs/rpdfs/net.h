@@ -20,6 +20,10 @@ struct rpdfs_net_message_desc {
 	u16 data_size;
 	u8 type;
 	u8 ctl_size;
+
+	/* only valid in recv fns */
+	unsigned long sender_nth_devd; /* sending devd's position in devd qlist */
+	u64 conn_qver;
 };
 
 /*
@@ -107,7 +111,8 @@ typedef int (*rpdfs_net_recv_fn_t)(struct rpdfs_fs_info *rfi, struct rpdfs_net_m
 int rpdfs_net_preload(struct rpdfs_fs_info *rfi, gfp_t gfp);
 void rpdfs_net_preload_end(struct rpdfs_fs_info *rfi);
 
-int rpdfs_net_connect(struct rpdfs_fs_info *rfi, struct rpdfs_net_transport_addr *addr);
+int rpdfs_net_connect(struct rpdfs_fs_info *rfi, struct rpdfs_net_transport_addr *addr,
+		      unsigned long nth, u64 qver);
 void rpdfs_net_disconnect(struct rpdfs_fs_info *rfi, struct rpdfs_net_transport_addr *addr);
 
 int rpdfs_net_send(struct rpdfs_fs_info *rfi, struct rpdfs_net_transport_addr *addr,

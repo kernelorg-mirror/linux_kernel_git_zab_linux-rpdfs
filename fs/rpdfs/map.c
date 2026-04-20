@@ -242,11 +242,11 @@ int rpdfs_map_connect(struct rpdfs_fs_info *rfi)
 	struct rpdfs_map_info *minf = RPDFS_MINF(rfi);
 	struct rpdfs_net_transport_addr addr;
 	unsigned long i;
-	u64 mver = 0;
+	u64 qver = 0;
 	int ret;
 
-	while (addr_iter(minf, &mver, &i, &addr, &ret)) {
-		ret = rpdfs_net_connect(rfi, &addr);
+	while (addr_iter(minf, &qver, &i, &addr, &ret)) {
+		ret = rpdfs_net_connect(rfi, &addr, i - 1, qver);
 		if (ret < 0)
 			break;
 	}

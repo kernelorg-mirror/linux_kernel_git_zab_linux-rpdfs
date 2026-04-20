@@ -43,6 +43,8 @@ struct rpdfs_net_connection {
 	struct rpdfs_fs_info *rfi;
 	struct work_struct shutdown_work;
 	struct rpdfs_net_transport_addr addr;
+	unsigned long peer_nth_devd;
+	u64 qver;
 	refcount_t refcount;
 	struct rcu_head rcu;
 	u8 priv[] __aligned(ARCH_KMALLOC_MINALIGN);
@@ -389,10 +391,13 @@ void rpdfs_net_recv(struct rpdfs_fs_info *rfi, void *priv, struct rpdfs_net_mess
 	int ret;
 
 	if (valid_message(md) && md->type < ARRAY_SIZE(ninf->recv_fns) &&
-	    (recv_fn = ninf->recv_fns[md->type]))
+	    (recv_fn = ninf->recv_fns[md->type])) {
+		md->sender_nth_devd = conn->peer_nth_devd;
+		md->conn_qver = conn->qver;
 		ret = recv_fn(rfi, md);
-	else
+	} else {
 		ret = -EPROTO;
+	}
 
 	if (ret < 0) {
 		rpdfs_err("recv fn err %d for %u on %pISpc, shutting down",
@@ -413,7 +418,8 @@ void rpdfs_net_recv(struct rpdfs_fs_info *rfi, void *priv, struct rpdfs_net_mess
  * that the caller has another endpoint that is now present at the
  * address.  (map versions protect conflicting use of the same address).
  */
-int rpdfs_net_connect(struct rpdfs_fs_info *rfi, struct rpdfs_net_transport_addr *addr)
+int rpdfs_net_connect(struct rpdfs_fs_info *rfi, struct rpdfs_net_transport_addr *addr,
+		      unsigned long n, u64 qver)
 {
 	struct rpdfs_net_info *ninf = RPDFS_NINF(rfi);
 	struct rpdfs_net_connection *conn = NULL;
@@ -429,6 +435,8 @@ int rpdfs_net_connect(struct rpdfs_fs_info *rfi, struct rpdfs_net_transport_addr
 	conn->rfi = rfi;
 	INIT_WORK(&conn->shutdown_work, rpdfs_net_shutdown_work_fn);
 	conn->addr = *addr;
+	conn->peer_nth_devd = n;
+	conn->qver = qver;
 	refcount_set(&conn->refcount, 1);
 	ninf->ops->init(rfi, ninf->ops_info, conn->priv);
 
