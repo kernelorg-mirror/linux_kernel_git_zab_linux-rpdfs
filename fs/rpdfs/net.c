@@ -336,8 +336,7 @@ void rpdfs_net_unregister_recv(struct rpdfs_fs_info *rfi, u8 type, rpdfs_net_rec
 
 bool rpdfs_net_invalid_sizes(struct rpdfs_net_message_desc *md)
 {
-	return md->ctl_size == 0 ||
-	       md->ctl_size > RPDFS_MSG_MAX_CTL_SIZE ||
+	return md->ctl_size > RPDFS_MSG_MAX_CTL_SIZE ||
 	       md->data_size > RPDFS_MSG_MAX_DATA_SIZE;
 }
 
