@@ -84,6 +84,28 @@ out:
 	return ret;
 }
 
+int rpdfs_map_nr_devds(struct rpdfs_fs_info *rfi, u64 *mver)
+{
+	struct rpdfs_map_info *minf = RPDFS_MINF(rfi);
+	struct addr_map *amap;
+	unsigned int seq;
+	int ret;
+
+	rcu_read_lock();
+	do {
+		seq = read_seqbegin(&minf->seqlock);
+		amap = rcu_dereference(minf->amap);
+		*mver = minf->mver;
+		if (amap)
+			ret = amap->count;
+		else
+			ret = -ENOENT;
+	} while (read_seqretry(&minf->seqlock, seq));
+	rcu_read_unlock();
+
+	return ret;
+}
+
 int rpdfs_map_bnr_to_addr(struct rpdfs_fs_info *rfi, u64 bnr,
 			  struct rpdfs_net_transport_addr *addr, u64 *mver)
 {
@@ -99,6 +121,31 @@ int rpdfs_map_bnr_to_addr(struct rpdfs_fs_info *rfi, u64 bnr,
 		*mver = minf->mver;
 		if (amap) {
 			*addr = amap->addrs[bnr % amap->count];
+			ret = 0;
+		} else {
+			ret = -ENOENT;
+		}
+	} while (read_seqretry(&minf->seqlock, seq));
+	rcu_read_unlock();
+
+	return ret;
+}
+
+int rpdfs_map_nth_addr(struct rpdfs_fs_info *rfi, unsigned int n,
+		       struct rpdfs_net_transport_addr *addr, u64 *mver)
+{
+	struct rpdfs_map_info *minf = RPDFS_MINF(rfi);
+	struct addr_map *amap;
+	unsigned int seq;
+	int ret;
+
+	rcu_read_lock();
+	do {
+		seq = read_seqbegin(&minf->seqlock);
+		amap = rcu_dereference(minf->amap);
+		*mver = minf->mver;
+		if (amap && n <= amap->count) {
+			*addr = amap->addrs[n];
 			ret = 0;
 		} else {
 			ret = -ENOENT;
