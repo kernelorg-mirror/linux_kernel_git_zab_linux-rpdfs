@@ -2,6 +2,8 @@
 #ifndef RPDFS_PLACE_H
 #define RPDFS_PLACE_H
 
+#include <asm/byteorder.h>
+
 #include "format-msg.h"
 
 #define RPF		"%llx%016llx"
