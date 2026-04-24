@@ -11,7 +11,6 @@ struct rpdfs_transaction;
 #include "txn.h"
 
 struct rpdfs_inode_info {
-	u64 ino;
 
 	/* updating vfs inode when wcount is older than block contents */
 	seqlock_t refresh_seqlock;
