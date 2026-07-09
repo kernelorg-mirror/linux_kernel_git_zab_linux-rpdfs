@@ -24,6 +24,7 @@ rpdfs-y	:= aops.o \
 	   parse.o \
 	   preq.o \
 	   rht.o \
+	   rlock.o \
 	   rpdfs_trace.o \
 	   super.o \
 	   txn.o \

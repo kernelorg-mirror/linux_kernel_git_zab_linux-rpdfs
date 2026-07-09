@@ -16,6 +16,7 @@ struct rpdfs_block_info;
 struct rpdfs_map_info;
 struct rpdfs_net_info;
 struct rpdfs_preq_info;
+struct rpdfs_rlock_info;
 
 struct rpdfs_fs_info {
 	struct super_block *sb;
@@ -28,6 +29,7 @@ struct rpdfs_fs_info {
 	struct rpdfs_map_info *map_info;
 	struct rpdfs_net_info *net_info;
 	struct rpdfs_preq_info *preq_info;
+	struct rpdfs_rlock_info *rlock_info;
 
 	struct percpu_counter pc_creates;
 };

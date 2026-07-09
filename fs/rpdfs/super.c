@@ -21,6 +21,7 @@
 #include "pr.h"
 #include "preq.h"
 #include "rpdfs_trace.h"
+#include "rlock.h"
 #include "xattr.h"
 
 struct rpdfs_fs_context {
@@ -102,6 +103,7 @@ static void rpdfs_destroy(struct rpdfs_fs_info *rfi)
 	rpdfs_balloc_destroy(rfi);
 	rpdfs_block_destroy(rfi);
 	rpdfs_aops_destroy(rfi);
+	rpdfs_rlock_destroy(rfi);
 	rpdfs_map_destroy(rfi);
 	rpdfs_net_destroy(rfi);
 }
@@ -114,6 +116,7 @@ static int rpdfs_setup(struct rpdfs_fs_info *rfi)
 	      rpdfs_map_setup(rfi) ?:
 	      rpdfs_block_setup(rfi) ?:
 	      rpdfs_balloc_setup(rfi) ?:
+	      rpdfs_rlock_setup(rfi) ?:
 	      rpdfs_aops_setup(rfi) ?:
 	      rpdfs_preq_setup(rfi);
 	if (ret < 0)

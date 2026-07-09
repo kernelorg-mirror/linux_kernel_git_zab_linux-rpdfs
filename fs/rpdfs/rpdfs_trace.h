@@ -7,6 +7,9 @@
  * something like include/trace/events/rpdfs.h .
  */
 
+#include "format-msg.h"
+#include "super.h"
+
 #undef TRACE_SYSTEM
 #define TRACE_SYSTEM rpdfs
 
@@ -14,11 +17,11 @@
 #define _TRACE_RPDFS_H
 
 #include <linux/tracepoint.h>
-
 #include "trace/common.h"
 
 #include "trace/alloc.h"
 #include "trace/block.h"
+#include "trace/rlock.h"
 #include "trace/txn.h"
 
 #endif /* _TRACE_RPDFS_H */
