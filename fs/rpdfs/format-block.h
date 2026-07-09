@@ -4,6 +4,7 @@
 
 #include <linux/types.h>
 #include <linux/align.h>
+#include <linux/bitfield.h>
 
 #define RPDFS_BLOCK_SHIFT	12
 #define RPDFS_BLOCK_SIZE	(1 << RPDFS_BLOCK_SHIFT)
@@ -98,6 +99,61 @@ struct rpdfs_btree_block {
 #define RPDFS_BTREE_ITEM_KEY_MASK	((1ULL << RPDFS_BTREE_ITEM_KEY_BITS) - 1)
 
 /*
+ * Hand tuned to be a power of two that doesn't limit the number of
+ * reasonably sized dirents/xattrs in a block.
+ *
+ * It might be worth it to squeeze the size of the entry down so we
+ * could go up another power of two.
+ */
+#define RPDFS_EHTABLE_ENTRIES_SHIFT	6
+#define RPDFS_EHTABLE_ENTRIES		(1 << RPDFS_EHTABLE_ENTRIES_SHIFT)
+#define RPDFS_EHTABLE_ENTRIES_MASK	(RPDFS_EHTABLE_ENTRIES - 1)
+
+#define RPDFS_EHTABLE_FULL_ENTRIES	(RPDFS_EHTABLE_ENTRIES * 80 / 100)
+
+/* resolve collisions by assigning low bits, enospc once consumed */
+#define RPDFS_EHTABLE_POS_BITS		2
+#define RPDFS_EHTABLE_POS_MASK		((1UL << RPDFS_EHTABLE_POS_BITS) - 1)
+
+/*
+ * Each level removes a high bit of the hash and then we want enough
+ * bits remaining for the number of entries in a block.
+ */
+#define RPDFS_EHTABLE_MAX_DEPTH	(32 - RPDFS_EHTABLE_ENTRIES_SHIFT)
+
+struct rpdfs_ehtable_desc {
+	__le32 nr_keys;
+	__le32 total_key_size;
+};
+
+struct rpdfs_ehtable_block {
+	__le16 tail_free;
+	__le16 total_free;
+	__le16 nr_entries;
+	__u8 depth;
+	__u8 _pad;
+	struct rpdfs_ehtable_entry {
+		__le32 hash;
+		__le16 offset;
+		__u8 probe_len;
+		__u8 pos;
+	} entries[RPDFS_EHTABLE_ENTRIES];
+};
+
+/*
+ * Items are an unaligned payload that starts with the le9 key_size and
+ * u7 val_size which are followed by the bytes of the key and value.
+ */
+struct rpdfs_ehtable_item {
+	__le16 key_val_sizes;
+} __packed;
+
+#define RPDFS_EHTABLE_KEY_SIZE_FIELD	GENMASK_U16(8, 0)
+#define RPDFS_EHTABLE_VAL_SIZE_FIELD	GENMASK_U16(15, 9)
+#define RPDFS_EHTABLE_MAX_KEY_SIZE	FIELD_MAX(RPDFS_EHTABLE_KEY_SIZE_FIELD)
+#define RPDFS_EHTABLE_MAX_VAL_SIZE	FIELD_MAX(RPDFS_EHTABLE_VAL_SIZE_FIELD)
+
+/*
  * The inode generation number changes every time a specific inode is
  * freed and reallocated. The inode number and generation number
  * uniquely identify a file/dir over its lifetime. This lets users of
@@ -111,6 +167,12 @@ struct rpdfs_ino_gen {
 	__le64 ino;	/* inode number, starts at 1 */
 	__le64 gen;	/* inode generation, starts at 1 */
 };
+
+struct rpdfs_inode_nr {
+	__le64 i[2];
+};
+
+#define RPDFS_INIT_ROOT_INODE_NR { { cpu_to_le64(1), cpu_to_le64(1) } }
 
 /*
  * Data blocks are pointed to by a simple tree of indirect blocks rooted
@@ -142,6 +204,7 @@ struct rpdfs_indirect_block {
 	struct rpdfs_block_ref refs[RPDFS_DATA_REFS_PER_BLK];
 };
 
+
 /*
  * Inodes are stored in inode blocks.  Inode blocks numbers are directly
  * calculated from the inode number.  The block itself is formatted as a
@@ -149,7 +212,7 @@ struct rpdfs_indirect_block {
  * as btree items in the block.
  */
 struct rpdfs_inode {
-	struct rpdfs_ino_gen ig;
+	struct rpdfs_inode_nr ino;
 	__le64 size;
 	__le64 version;			/* changed on file content/metadata changes */
 	struct rpdfs_ino_gen parent_ig;	/* only valid for directories */
@@ -166,6 +229,8 @@ struct rpdfs_inode {
 	__le64 ctime_nsec;
 	__le64 mtime_nsec;
 	__le64 crtime_nsec;
+	struct rpdfs_ehtable_desc dirent_eht;
+	struct rpdfs_ehtable_desc xattr_eht;
 	struct rpdfs_btree_root dirents;
 	struct rpdfs_btree_root xattrs;
 	struct rpdfs_data_root data;
@@ -173,6 +238,7 @@ struct rpdfs_inode {
 
 #define RPDFS_ROOT_INO 1
 #define RPDFS_ROOT_GEN 1
+
 
 /*
  * This is totally arbitrary.  It looks like it's 32bit in the stat ABI.
@@ -191,7 +257,7 @@ enum rpdfs_dentry_type {
 };
 
 struct rpdfs_dirent {
-	struct rpdfs_ino_gen ig; /* inode number and generation */
+	struct rpdfs_inode_nr ino;
 	__u8 pers_dtype; /* rpdfs persistent directory entry type */
 	__u8 name_len; /* no null termination */
 	union {
@@ -207,13 +273,13 @@ struct rpdfs_dirent {
 #define RPDFS_NAME_MAX	255
 
 /* just a random value */
-#define RPDFS_DIRENT_HASH_SEED	0xce94cad8f038f79a
+#define RPDFS_DIRENT_HASH_SEED	0xce94cad8
 
 /* reserved hash values for . and .. */
 #define RPDFS_DIRENT_DOT_HASH	 	0ULL
 #define RPDFS_DIRENT_DOT_DOT_HASH	1ULL
 /* the btree clears collision bits so we must use a min past them */
-#define RPDFS_DIRENT_MIN_HASH		(RPDFS_BTREE_KEY_COLL_MASK + 1)
+#define RPDFS_DIRENT_MIN_HASH		(RPDFS_EHTABLE_POS_MASK + 1)
 
 /*
  * An empty dir contains pseudo entries for "." and "..". The reported
@@ -244,6 +310,6 @@ struct rpdfs_xattr {
  */
 #define RPDFS_XATTR_MAX_NAMES_LEN	65536
 
-#define RPDFS_XATTR_HASH_SEED		0xfadefadefadefade
+#define RPDFS_XATTR_HASH_SEED		0x416a8d97
 
 #endif

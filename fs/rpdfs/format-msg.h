@@ -19,6 +19,11 @@ enum {
 	RPDFS_MSG_FREE_STRIPE_GRANT,
 	RPDFS_MSG_BLOCK_COUNTS_REQUEST,
 	RPDFS_MSG_BLOCK_COUNTS_RESULT,
+	RPDFS_MSG_RLOCK_REQUEST,
+	RPDFS_MSG_RLOCK_GRANT,
+	RPDFS_MSG_RLOCK_REVOKE,
+	RPDFS_MSG_RLOCK_CONFIRM,
+	RPDFS_MSG_RLOCK_RELEASE,
 	RPDFS_MSG__NR,
 };
 
@@ -29,9 +34,34 @@ enum {
 	RPDFS_MSG_ERR__INVALID,
 };
 
+enum {
+
+	/*
+	 * 0 so that we can have natural if (mode) tests.
+	 */
+	RPDFS_RLOCK_MODE_NULL = 0,
+	/*
+	 * The client has rlock but not for read or write ops.  Is
+	 * compatible with all other modes.  (unused for now, but will
+	 * be used to track presence in client caches that prevent
+	 * deletion.)
+	 */
+	RPDFS_RLOCK_MODE_NONE,
+	/*
+	 * Shared read -- excludes write modes and blocks can be read.
+	 */
+	RPDFS_RLOCK_MODE_SH_RD,
+	/*
+	 * Exclusive write -- excludes write and read modes, blocks can be both read
+	 * and written.
+	 */
+	RPDFS_RLOCK_MODE_EX_WR,
+	RPDFS_RLOCK_MODE__INVALID,
+};
+
 /*
  * _NULL is 0 so we can have natural if (mode) tests.  _NONE is the mode
- * that grants no access and causes the client and server to free
+ * that grants no rlock and causes the client and server to free
  * tracking of the cached block.
  *
  * The modes are also numerically sorted from least to most restrictive.
@@ -58,14 +88,33 @@ struct rpdfs_msg_header {
 #define RPDFS_MSG_MAX_CTL_SIZE	255
 #define RPDFS_MSG_MAX_DATA_SIZE 4096
 
-struct rpdfs_msg_block_read {
-	__le64 bnr;
-	__le64 flags;
-	__u8 request_mode;
-	__u8 _pad[7];
+/*
+ * k[0,1] are the inode_nr.  k[2] is a packing of a u8 key and u56
+ * index.
+ */
+struct rpdfs_block_key {
+	__le64 k[3];
 };
 
-#define RPDFS_MSG_BLOCK_READ_FLAG_DATA	(1 << 0)
+/* the high byte of k[2] is the type */
+#define RPDFS_BLOCK_KEY_TYPE__SHIFT	(64 - 8)
+/* the low bits of k[2] is the index for the type */
+#define RPDFS_BLOCK_KEY_INDEX__MASK	((1ULL << RPDFS_BLOCK_KEY_TYPE__SHIFT) - 1)
+
+#define RPDFS_BLOCK_KEY_TYPE_INODE	0
+#define RPDFS_BLOCK_KEY_TYPE_XATTR	1
+#define RPDFS_BLOCK_KEY_TYPE_DIRENT	2
+#define RPDFS_BLOCK_KEY_TYPE_DATA	3
+#define RPDFS_BLOCK_KEY_TYPE__INVALID	4
+
+static inline u8 rpdfs_block_key_type(struct rpdfs_block_key *key)
+{
+	return le64_to_cpu(key->k[2]) >> RPDFS_BLOCK_KEY_TYPE__SHIFT;
+}
+
+struct rpdfs_msg_block_read {
+	struct rpdfs_block_key key;
+};
 
 /*
  * A block's place is a 128bit value that uniquely identifies the
@@ -99,27 +148,36 @@ struct rpdfs_msg_block_details {
 	__le64 wcount;
 	__le64 place_lo;
 	__le64 place_hi;
+	__le64 crc;
 };
 
 struct rpdfs_msg_block_read_result {
-	__le64 bnr;
+	struct rpdfs_block_key key;
 	struct rpdfs_msg_block_details det;
-	__u8 grant_mode;
+	__u8 _pad[7];
 	__u8 err;
-	__u8 _pad[6];
 };
 
 struct rpdfs_msg_block_write {
-	__le64 bnr;
+	struct rpdfs_block_key key;
 	struct rpdfs_msg_block_details det;
-	__u8 confirm_mode;
-	__u8 _pad[7];
 };
 
 struct rpdfs_msg_block_write_result {
-	__le64 bnr;
-	__u8 err;
+	struct rpdfs_block_key key;
 	__u8 _pad[7];
+	__u8 err;
+};
+
+struct rpdfs_rlock_key {
+	__le64 k[2];
+};
+
+struct rpdfs_msg_rlock {
+	struct rpdfs_rlock_key key;
+	__u8 _pad[6];
+	__u8 mode;
+	__u8 flags;
 };
 
 struct rpdfs_msg_cache_mode {
