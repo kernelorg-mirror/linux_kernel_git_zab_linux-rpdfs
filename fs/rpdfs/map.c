@@ -2,6 +2,7 @@
 
 #include <linux/kernel.h>
 #include <linux/rcupdate.h>
+#include <linux/xxhash.h>
 
 #include "map.h"
 #include "net.h"
@@ -10,7 +11,10 @@
 struct addr_map {
 	struct rcu_head rcu;
 	unsigned long count;
-	struct rpdfs_net_transport_addr addrs[];
+	struct map_entry {
+		struct rpdfs_net_transport_addr addr;
+		u32 rv;
+	} entries[];
 };
 
 struct rpdfs_map_info {
@@ -54,19 +58,22 @@ int rpdfs_map_add_addr(struct rpdfs_fs_info *rfi, struct rpdfs_net_transport_add
 		} while (read_seqretry(&minf->seqlock, seq));
 		rcu_read_unlock();
 
-		next = kvmalloc(offsetof(struct addr_map, addrs[count]), GFP_NOFS);
+		next = kvmalloc(offsetof(struct addr_map, entries[count]), GFP_NOFS);
 		if (!next) {
 			ret = -ENOMEM;
 			goto out;
 		}
 
 		next->count = count;
-		next->addrs[count - 1] = *addr;
+		next->entries[count - 1].addr = *addr;
+		next->entries[count - 1].rv = xxh32(addr, sizeof(struct rpdfs_net_transport_addr),
+						    0);
 
 		write_seqlock(&minf->seqlock);
 		if (minf->mver == mver) {
 			if (amap) {
-				memcpy(next->addrs, amap->addrs, amap->count * sizeof(*addr));
+				memcpy(next->entries, amap->entries,
+				       amap->count * sizeof(struct map_entry));
 				kvfree_rcu(amap, rcu);
 			}
 			rcu_assign_pointer(minf->amap, next);
@@ -120,7 +127,7 @@ int rpdfs_map_bnr_to_addr(struct rpdfs_fs_info *rfi, u64 bnr,
 		amap = rcu_dereference(minf->amap);
 		*mver = minf->mver;
 		if (amap) {
-			*addr = amap->addrs[bnr % amap->count];
+			*addr = amap->entries[bnr % amap->count].addr;
 			ret = 0;
 		} else {
 			ret = -ENOENT;
@@ -129,6 +136,68 @@ int rpdfs_map_bnr_to_addr(struct rpdfs_fs_info *rfi, u64 bnr,
 	rcu_read_unlock();
 
 	return ret;
+}
+
+/*
+ * Rather than hash an object's identity with every destination, we
+ * calculate strong hashes for each and then find the score by
+ * multiplying the hash values.  It's still consistent, reasonably
+ * distributed, and much faster (and could be vectored).
+ */
+static u32 rendezvous(struct addr_map *amap, u32 rv)
+{
+	unsigned long i;
+	u32 greatest = 0;
+	u32 score;
+	u32 r = 0;
+
+	for (i = 0; i < amap->count; i++) {
+		score = rv * amap->entries[i].rv;
+		if (score > greatest) {
+			greatest = score;
+			r = i;
+		}
+	}
+
+	return r;
+}
+
+int rpdfs_map_rv_to_addr(struct rpdfs_fs_info *rfi, u32 rv,
+			 struct rpdfs_net_transport_addr *addr, u64 *mver)
+{
+	struct rpdfs_map_info *minf = RPDFS_MINF(rfi);
+	struct addr_map *amap;
+	unsigned int seq;
+	unsigned long r;
+	int ret;
+
+	rcu_read_lock();
+	do {
+		seq = read_seqbegin(&minf->seqlock);
+		amap = rcu_dereference(minf->amap);
+		*mver = minf->mver;
+		if (amap) {
+			r = rendezvous(amap, rv);
+			*addr = amap->entries[r].addr;
+			ret = 0;
+		} else {
+			ret = -ENOENT;
+		}
+	} while (read_seqretry(&minf->seqlock, seq));
+	rcu_read_unlock();
+
+	return ret;
+}
+
+/*
+ * Ideally callers can cache the rv calculation in their object that's
+ * consistently being sent with the same identifier.  This is for when
+ * they can't.
+ */
+int rpdfs_map_hash_rv_to_addr(struct rpdfs_fs_info *rfi, void *data, size_t len,
+			      struct rpdfs_net_transport_addr *addr, u64 *mver)
+{
+	return rpdfs_map_rv_to_addr(rfi, xxh32(data, len, 0), addr, mver);
 }
 
 int rpdfs_map_nth_addr(struct rpdfs_fs_info *rfi, unsigned int n,
@@ -145,7 +214,7 @@ int rpdfs_map_nth_addr(struct rpdfs_fs_info *rfi, unsigned int n,
 		amap = rcu_dereference(minf->amap);
 		*mver = minf->mver;
 		if (amap && n <= amap->count) {
-			*addr = amap->addrs[n];
+			*addr = amap->entries[n].addr;
 			ret = 0;
 		} else {
 			ret = -ENOENT;
@@ -218,7 +287,7 @@ static bool addr_iter(struct rpdfs_map_info *minf, u64 *mver, unsigned long *i,
 					*i = 0;
 				}
 				if (*i < amap->count) {
-					*addr = amap->addrs[*i];
+					*addr = amap->entries[*i].addr;
 					got = true;
 				}
 			}

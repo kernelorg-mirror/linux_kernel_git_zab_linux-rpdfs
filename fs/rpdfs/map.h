@@ -9,6 +9,10 @@ int rpdfs_map_add_addr(struct rpdfs_fs_info *rfi, struct rpdfs_net_transport_add
 int rpdfs_map_nr_devds(struct rpdfs_fs_info *rfi, u64 *mver);
 int rpdfs_map_bnr_to_addr(struct rpdfs_fs_info *rfi, u64 bnr,
 			  struct rpdfs_net_transport_addr *addr, u64 *mver);
+int rpdfs_map_rv_to_addr(struct rpdfs_fs_info *rfi, u32 rv,
+			 struct rpdfs_net_transport_addr *addr, u64 *mver);
+int rpdfs_map_hash_rv_to_addr(struct rpdfs_fs_info *rfi, void *data, size_t len,
+			      struct rpdfs_net_transport_addr *addr, u64 *mver);
 int rpdfs_map_nth_addr(struct rpdfs_fs_info *rfi, unsigned int n,
 		       struct rpdfs_net_transport_addr *addr, u64 *mver);
 int rpdfs_map_alloc_stripe_geom(struct rpdfs_fs_info *rfi, u64 bnr, unsigned long *this_stripe,
