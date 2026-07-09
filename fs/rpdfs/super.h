@@ -3,6 +3,7 @@
 #define RPDFS_SUPER_H
 
 #include <linux/fs.h>
+#include <linux/pagemap.h>
 #include <linux/inet.h>
 #include <linux/uuid.h>
 
@@ -17,7 +18,9 @@ struct rpdfs_net_info;
 struct rpdfs_preq_info;
 
 struct rpdfs_fs_info {
+	struct super_block *sb;
 	u8 client_uuid[UUID_SIZE];
+	atomic64_t next_free_inode_nr;
 	struct rpdfs_balloc_info *balloc_info;
 	struct rpdfs_block_info *block_info;
 	struct rpdfs_map_info *map_info;
@@ -41,4 +44,15 @@ static inline struct rpdfs_fs_info *RPDFS_DENTRY_FS(struct dentry *dentry)
 {
 	return RPDFS_INODE_FS(d_inode(dentry));
 }
+
+static inline struct rpdfs_fs_info *RPDFS_MAPPING_FS(struct address_space *mapping)
+{
+	return RPDFS_INODE_FS(mapping->host);
+}
+
+static inline struct rpdfs_fs_info *RPDFS_FOLIO_FS(struct folio *folio)
+{
+	return RPDFS_INODE_FS(folio_inode(folio));
+}
+
 #endif

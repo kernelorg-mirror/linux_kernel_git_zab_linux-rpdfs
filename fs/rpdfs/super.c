@@ -158,6 +158,7 @@ static int rpdfs_get_tree(struct fs_context *fc)
 
 	/* generate as early as possible for tracing */
 	generate_random_uuid(rfi->client_uuid);
+	atomic64_set(&rfi->next_free_inode_nr, 2);
 
 	fc->s_fs_info = rfi;
 	sb = sget_fc(fc, NULL, rpdfs_set_super);
@@ -167,6 +168,7 @@ static int rpdfs_get_tree(struct fs_context *fc)
 		goto out;
 	}
 
+	rfi->sb = sb;
 	/* use the uuid as a little fingerprint for now, might prefer client qlist id */
 	snprintf(sb->s_id, sizeof(sb->s_id), RFI_TRACE_TPF, RFI_TRACE_ID(rfi));
 
