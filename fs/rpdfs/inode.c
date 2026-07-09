@@ -105,10 +105,6 @@ static void copy_rinode_to_vfs_inode(struct inode *inode, struct rpdfs_inode *ri
 
 	ri->dirent_eht = rinode->dirent_eht;
 	ri->xattr_eht = rinode->xattr_eht;
-	ri->dirents = rinode->dirents;
-
-	ri->xattrs = rinode->xattrs;
-	ri->xattr_creates = rinode->xattr_creates;
 
 	ri->refreshed = true;
 }
@@ -136,10 +132,6 @@ static void copy_vfs_inode_to_rinode(struct rpdfs_inode *rinode, struct inode *i
 
 	rinode->dirent_eht = ri->dirent_eht;
 	rinode->xattr_eht = ri->xattr_eht;
-	rinode->dirents = ri->dirents;
-
-	rinode->xattrs = ri->xattrs;
-	rinode->xattr_creates = ri->xattr_creates;
 
 	ri->refreshed = true;
 }
@@ -381,9 +373,9 @@ struct inode *rpdfs_find_inode_rcu(struct super_block *sb, struct rpdfs_iget_dat
 
 /*
  * Allocate and insert a I_NEW|I_CREATING inode in the vfs at the given
- * ig.  This can block waiting for other aliases of the ig to drain, or
- * can return errors if a duplicate ig was fully inserted (would
- * indicate inconsistency somewhere).
+ * inode number.  This can block waiting for other aliases of the inode
+ * to drain, or can return errors if a duplicate was fully inserted
+ * (would indicate inconsistency somewhere).
  *
  * The caller is entirely responsible for finishing initialization of
  * the inode and either instantiating it or unhashing and dropping it.

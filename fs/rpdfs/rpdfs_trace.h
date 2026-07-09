@@ -19,10 +19,7 @@
 #include <linux/tracepoint.h>
 #include "trace/common.h"
 
-#include "trace/alloc.h"
-#include "trace/block.h"
 #include "trace/rlock.h"
-#include "trace/txn.h"
 
 #endif /* _TRACE_RPDFS_H */
 

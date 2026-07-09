@@ -356,18 +356,6 @@ static bool valid_message(struct rpdfs_net_message_desc *md)
 		    (md->data_size != 0))
 			return false;
 		break;
-	case RPDFS_MSG_BLOCK_GRANT_MODE:
-	case RPDFS_MSG_BLOCK_REVOKE_MODE:
-		if ((md->ctl_size != sizeof(struct rpdfs_msg_cache_mode)) ||
-		    (md->data_size != 0))
-			return false;
-		break;
-	case RPDFS_MSG_FREE_STRIPE_GRANT:
-		if ((md->ctl_size != sizeof(struct rpdfs_msg_free_stripe_grant)) ||
-		    (md->data_size > (RPDFS_MSG_BLOCKS_PER_FREE_STRIPE *
-				      sizeof(struct rpdfs_msg_free_stripe_detail))))
-			return false;
-		break;
 	case RPDFS_MSG_BLOCK_COUNTS_RESULT:
 		if ((md->ctl_size != sizeof(struct rpdfs_msg_block_counts_result)) ||
 		    (md->data_size != 0))

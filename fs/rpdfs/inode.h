@@ -39,8 +39,6 @@ struct rpdfs_inode_info {
 
 	struct rpdfs_ehtable_desc dirent_eht;
 	struct rpdfs_ehtable_desc xattr_eht;
-	struct rpdfs_btree_root dirents;
-	struct rpdfs_btree_root xattrs;
 
 	struct inode vfs_inode;
 };
