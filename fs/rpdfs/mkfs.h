@@ -2,7 +2,7 @@
 #ifndef RPDFS_MKFS_H
 #define RPDFS_MKFS_H
 
-int rpdfs_mkfs(struct rpdfs_fs_info *rfi);
+int rpdfs_mkfs_root_inode(struct inode *inode);
 
 #endif
 

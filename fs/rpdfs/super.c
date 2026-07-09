@@ -13,7 +13,6 @@
 #include "aops.h"
 #include "inode.h"
 #include "map.h"
-#include "mkfs.h"
 #include "net.h"
 #include "net_tcp.h"
 #include "params.h"
@@ -188,12 +187,6 @@ static int rpdfs_get_tree(struct fs_context *fc)
 	      rpdfs_map_connect(rfi);
 	if (ret < 0)
 		goto out;
-
-	if (rfc->mkfs) {
-		ret = rpdfs_mkfs(rfi);
-		if (ret < 0)
-			goto out;
-	}
 
 	inode = rpdfs_iget(sb, &root_ig);
 	if (IS_ERR(inode)) {
