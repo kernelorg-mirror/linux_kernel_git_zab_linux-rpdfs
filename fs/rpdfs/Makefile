@@ -19,6 +19,7 @@ rpdfs-y	:= aops.o \
 	   ht.o \
 	   inode.o \
 	   map.o \
+	   meta.o \
 	   mkfs.o \
 	   net.o \
 	   net_tcp.o \
