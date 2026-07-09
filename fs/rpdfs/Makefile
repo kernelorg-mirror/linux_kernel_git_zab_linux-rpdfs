@@ -8,7 +8,8 @@ CFLAGS_rpdfs_trace.o = -I$(src)
 
 obj-$(CONFIG_RPDFS_FS) += rpdfs.o
 
-rpdfs-y	:= balloc.o \
+rpdfs-y	:= aops.o \
+	   balloc.o \
            block.o \
 	   btree.o \
 	   btree_txn.o \

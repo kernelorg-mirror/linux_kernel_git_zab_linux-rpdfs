@@ -10,6 +10,7 @@
 
 #include "balloc.h"
 #include "block.h"
+#include "aops.h"
 #include "inode.h"
 #include "map.h"
 #include "mkfs.h"
@@ -100,6 +101,7 @@ static void rpdfs_destroy(struct rpdfs_fs_info *rfi)
 	rpdfs_preq_destroy(rfi);
 	rpdfs_balloc_destroy(rfi);
 	rpdfs_block_destroy(rfi);
+	rpdfs_aops_destroy(rfi);
 	rpdfs_map_destroy(rfi);
 	rpdfs_net_destroy(rfi);
 }
@@ -112,6 +114,7 @@ static int rpdfs_setup(struct rpdfs_fs_info *rfi)
 	      rpdfs_map_setup(rfi) ?:
 	      rpdfs_block_setup(rfi) ?:
 	      rpdfs_balloc_setup(rfi) ?:
+	      rpdfs_aops_setup(rfi) ?:
 	      rpdfs_preq_setup(rfi);
 	if (ret < 0)
 		rpdfs_destroy(rfi);
