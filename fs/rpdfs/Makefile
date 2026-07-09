@@ -14,6 +14,7 @@ rpdfs-y	:= aops.o \
 	   btree.o \
 	   btree_txn.o \
 	   dir.o \
+	   ehtable.o \
 	   file.o \
 	   ht.o \
 	   inode.o \
