@@ -79,7 +79,7 @@ static const struct super_operations rpdfs_sop = {
 	.free_inode	= rpdfs_free_inode,
 	.sync_fs	= rpdfs_sync_fs,
 	.statfs		= rpdfs_statfs,
-	.write_inode	= rpdfs_write_inode,
+	.evict_inode	= rpdfs_evict_inode,
 };
 
 static int rpdfs_set_super(struct super_block *sb, struct fs_context *fc)
@@ -140,10 +140,7 @@ static int add_devd_addrs(struct rpdfs_fs_info *rfi, struct rpdfs_params *params
 
 static int rpdfs_get_tree(struct fs_context *fc)
 {
-	static struct rpdfs_ino_gen root_ig = {
-		.ino = cpu_to_le64(RPDFS_ROOT_INO),
-		.gen = cpu_to_le64(RPDFS_ROOT_GEN),
-	};
+	static struct rpdfs_inode_nr root_ino = RPDFS_INIT_ROOT_INODE_NR;
 	struct rpdfs_fs_context *rfc = fc->fs_private;
 	struct rpdfs_fs_info *rfi = NULL;
 	struct super_block *sb = NULL;
@@ -188,7 +185,7 @@ static int rpdfs_get_tree(struct fs_context *fc)
 	if (ret < 0)
 		goto out;
 
-	inode = rpdfs_iget(sb, &root_ig);
+	inode = rpdfs_iget(sb, &root_ino);
 	if (IS_ERR(inode)) {
 		ret = PTR_ERR(inode);
 		goto out;

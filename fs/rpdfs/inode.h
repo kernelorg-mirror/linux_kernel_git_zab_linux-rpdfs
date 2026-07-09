@@ -3,18 +3,29 @@
 #define RPDFS_INODE_H
 
 #include <linux/fs.h>
+#include <linux/pagemap.h>
 
 struct rpdfs_transaction;
+struct rpdfs_rlock_hold;
 
 #include "format-block.h"
-#include "block.h"
-#include "txn.h"
+#include "super.h"
+
+struct rpdfs_iget_data {
+	struct rpdfs_inode_nr ino;
+	bool is_shadow;
+};
+
+#define RIF "%llu.%llu:%u"
+#define RIA(inode) \
+	le64_to_cpu(RPDFS_I(inode)->ino.i[0]), le64_to_cpu(RPDFS_I(inode)->ino.i[1]), \
+	RPDFS_I(inode)->is_shadow
 
 struct rpdfs_inode_info {
 
-	/* updating vfs inode when wcount is older than block contents */
+	/* updating vfs inode after acquiring rlock */
 	seqlock_t refresh_seqlock;
-	u64 refresh_wcount;
+	bool refreshed;
 
 	/* Uniquifier to avoid xattr name hash collisions */
 	__le64 xattr_creates;
@@ -22,7 +33,12 @@ struct rpdfs_inode_info {
 	/* Creation time is not tracked in VFS inode, do it here */
 	__le64 crtime_nsec;
 
-	struct rpdfs_ino_gen ig;
+	struct rpdfs_inode_nr ino;
+	struct inode *shadow_inode;
+	bool is_shadow;
+
+	struct rpdfs_ehtable_desc dirent_eht;
+	struct rpdfs_ehtable_desc xattr_eht;
 	struct rpdfs_btree_root dirents;
 	struct rpdfs_btree_root xattrs;
 
@@ -34,29 +50,22 @@ static inline struct rpdfs_inode_info *RPDFS_I(const struct inode *inode)
 	return container_of(inode, struct rpdfs_inode_info, vfs_inode);
 }
 
-static inline struct rpdfs_ino_gen *rpdfs_inode_ig(struct inode *inode)
+static inline struct rpdfs_inode_info *RPDFS_FOLIO_I(struct folio *folio)
 {
-	return &RPDFS_I(inode)->ig;
+	return RPDFS_I(folio_inode(folio));
 }
 
-static inline u64 rpdfs_ino_bnr(u64 bnr)
+static inline struct rpdfs_inode_nr rpdfs_inode_ino(struct inode *inode)
 {
-	return bnr;
+	return RPDFS_I(inode)->ino;
 }
 
-static inline u64 rpdfs_inode_ino(const struct inode *inode)
-{
-	return le64_to_cpu(RPDFS_I(inode)->ig.ino);
-}
-
-static inline u64 rpdfs_inode_bnr(struct inode *inode)
-{
-	return rpdfs_ino_bnr(rpdfs_inode_ino(inode));
-}
+void rpdfs_alloc_inode_nr(struct rpdfs_fs_info *rfi, struct rpdfs_inode_nr *ino);
+ino_t rpdfs_inode_presentation(const struct rpdfs_inode_nr *ino);
 
 struct inode *rpdfs_alloc_inode(struct super_block *sb);
 void rpdfs_free_inode(struct inode *inode);
-int rpdfs_write_inode(struct inode *inode, struct writeback_control *wbc);
+void rpdfs_evict_inode(struct inode *inode);
 
 void rpdfs_inode_init_ops(struct inode *inode);
 
@@ -67,17 +76,11 @@ int rpdfs_getattr(struct mnt_idmap *idmap, const struct path *path,
 int rpdfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		  struct iattr *attr);
 
-struct inode *rpdfs_iget(struct super_block *sb, struct rpdfs_ino_gen *ig);
-struct inode *rpdfs_new_inode(struct super_block *sb, struct rpdfs_ino_gen *ig);
-int rpdfs_inode_acquire_ordered(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
-				struct inode *a, struct rpdfs_block_handle **a_hnd,
-				struct inode *b, struct rpdfs_block_handle **b_hnd,
-				struct inode *c, struct rpdfs_block_handle **c_hnd,
-				struct inode *d, struct rpdfs_block_handle **d_hnd, rbaf_t rbaf);
-int rpdfs_inode_acquire(struct rpdfs_fs_info *rfi, struct rpdfs_transaction *txn,
-			struct inode *inode, struct rpdfs_block_handle **hnd, rbaf_t rbaf);
-void rpdfs_inode_update(struct rpdfs_fs_info *rfi, struct inode *inode,
-			struct rpdfs_block_handle *hnd);
+struct inode *rpdfs_iget(struct super_block *sb, struct rpdfs_inode_nr *ino);
+struct inode *rpdfs_find_inode_rcu(struct super_block *sb, struct rpdfs_iget_data *igd);
+struct inode *rpdfs_new_inode(struct super_block *sb, struct rpdfs_iget_data *igd);
+int rpdfs_inode_rlock_refresh(struct inode *inode, u8 mode, struct rpdfs_rlock_hold *hold);
+void rpdfs_inode_update(struct rpdfs_fs_info *rfi, struct inode *inode);
 
 int rpdfs_inode_init(void);
 void rpdfs_inode_exit(void);
