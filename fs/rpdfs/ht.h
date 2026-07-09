@@ -15,6 +15,7 @@ struct rpdfs_ht_entry *rpdfs_ht_insert(struct rhashtable *ht, struct rpdfs_ht_en
 				       const struct rhashtable_params params);
 struct rpdfs_ht_entry *rpdfs_ht_get(struct rhashtable *ht, void *key,
 				    const struct rhashtable_params params);
+void rpdfs_ht_inc(struct rpdfs_ht_entry *hte);
 bool rpdfs_ht_put(struct rhashtable *ht, struct rpdfs_ht_entry *hte,
 		  const struct rhashtable_params params, bool try_remove);
 

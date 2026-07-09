@@ -24,7 +24,6 @@
  * with something like kfree_rcu as put returns true.
  */
 
-
 /*
  * Insert an entry in the table.  The object needs to be fully
  * initialized before calling.  It will be visible to lookups while in
@@ -76,6 +75,11 @@ struct rpdfs_ht_entry *rpdfs_ht_get(struct rhashtable *ht, void *key,
 	rcu_read_unlock();
 
 	return hte;
+}
+
+void rpdfs_ht_inc(struct rpdfs_ht_entry *hte)
+{
+	BUG_ON(!refcount_inc_not_zero(&hte->refcount));
 }
 
 /*
