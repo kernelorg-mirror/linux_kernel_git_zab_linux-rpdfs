@@ -163,6 +163,11 @@ static int rpdfs_get_tree(struct fs_context *fc)
 	/* use the uuid as a little fingerprint for now, might prefer client qlist id */
 	snprintf(sb->s_id, sizeof(sb->s_id), RFI_TRACE_TPF, RFI_TRACE_ID(rfi));
 
+	/* using the per-client random uuid as a fingerprint, should be qlist id */
+	ret = super_setup_bdi_name(sb, "%s", sb->s_id);
+	if (ret < 0)
+		goto out;
+
 	/*
 	 * XXX We hack together an analog of a map with the devd
 	 * addresses instead of connecting to a quorumd to get devd
