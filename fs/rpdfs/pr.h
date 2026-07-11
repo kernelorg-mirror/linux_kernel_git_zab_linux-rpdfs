@@ -5,8 +5,22 @@
 #include <linux/fs.h>
 #include <linux/dynamic_debug.h>
 #include <linux/printk.h>
-
+#include "format-msg.h"
 #include "super.h"
+
+#define RBKF		"%llx.%llx.%x.%llx"
+#define RBKA(bk)	le64_to_cpu((bk)->k[0]), le64_to_cpu((bk)->k[1]), \
+			(u8)(le64_to_cpu((bk)->k[2]) >> RPDFS_BLOCK_KEY_TYPE__SHIFT), \
+			(le64_to_cpu((bk)->k[2]) & RPDFS_BLOCK_KEY_INDEX__MASK)
+
+#define folio_flag_char(folio, suffix, c) \
+	(folio_test_##suffix(folio) ? c : '-')
+#define RFF		"f mp %p ind %lu rc %d %c%c%c%c"
+#define RFA(folio)	(folio)->mapping, (folio)->index, folio_ref_count(folio), \
+			folio_flag_char(folio, locked, 'l'), \
+			folio_flag_char(folio, writeback, 'w'), \
+			folio_flag_char(folio, uptodate, 'u'), \
+			folio_flag_char(folio, dirty, 'd')
 
 #define rpdfs_err(fmt, args...) \
 	printk(KERN_ERR "rpdfs: "fmt, ##args)
