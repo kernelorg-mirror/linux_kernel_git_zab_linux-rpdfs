@@ -5,6 +5,7 @@
 #include "file.h"
 #include "inode.h"
 #include "pr.h"
+#include "xattr.h"
 
 static int rpdfs_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 {
@@ -51,6 +52,7 @@ static ssize_t rpdfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 const struct inode_operations rpdfs_file_iops = {
 	.getattr	= rpdfs_getattr,
 	.setattr	= rpdfs_setattr,
+	.listxattr	= rpdfs_listxattr,
 };
 
 const struct file_operations rpdfs_file_fops = {
