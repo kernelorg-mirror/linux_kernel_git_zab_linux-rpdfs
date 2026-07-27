@@ -175,6 +175,12 @@ static int recv_block_counts_result(struct rpdfs_fs_info *rfi, struct rpdfs_net_
 	struct parallel_request *req = &prinf->block_counts;
 	int ret;
 
+	if ((md->ctl_size != sizeof(struct rpdfs_msg_block_counts_result)) ||
+	    (md->data_size != 0)) {
+		ret = -EPROTO;
+		goto out;
+	}
+
 	write_seqlock(&req->seqlock);
 
 	ret = finish_one_in_flight(req, md->sender_nth_devd, 0); /* XXX no err? */
@@ -188,6 +194,7 @@ static int recv_block_counts_result(struct rpdfs_fs_info *rfi, struct rpdfs_net_
 
 	write_sequnlock(&req->seqlock);
 
+out:
 	return ret;
 }
 

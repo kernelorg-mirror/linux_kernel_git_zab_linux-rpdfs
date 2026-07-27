@@ -340,34 +340,6 @@ bool rpdfs_net_invalid_sizes(struct rpdfs_net_message_desc *md)
 	       md->data_size > RPDFS_MSG_MAX_DATA_SIZE;
 }
 
-static bool valid_message(struct rpdfs_net_message_desc *md)
-{
-	if (rpdfs_net_invalid_sizes(md))
-		return false;
-
-	switch(md->type) {
-	case RPDFS_MSG_BLOCK_READ_RESULT:
-		if ((md->ctl_size != sizeof(struct rpdfs_msg_block_read_result)) ||
-		    (md->data_size > 0 && md->data_size != RPDFS_BLOCK_SIZE))
-			return false;
-		break;
-	case RPDFS_MSG_BLOCK_WRITE_RESULT:
-		if ((md->ctl_size != sizeof(struct rpdfs_msg_block_write_result)) ||
-		    (md->data_size != 0))
-			return false;
-		break;
-	case RPDFS_MSG_BLOCK_COUNTS_RESULT:
-		if ((md->ctl_size != sizeof(struct rpdfs_msg_block_counts_result)) ||
-		    (md->data_size != 0))
-			return false;
-		break;
-	default:
-		return false;
-	}
-
-	return true;
-}
-
 /*
  * Receive an incoming message.  The transport has only received the
  * buffers, it hasn't checked the contents.
@@ -382,8 +354,7 @@ void rpdfs_net_recv(struct rpdfs_fs_info *rfi, void *priv, struct rpdfs_net_mess
 	rpdfs_net_recv_fn_t recv_fn;
 	int ret;
 
-	if (valid_message(md) && md->type < ARRAY_SIZE(ninf->recv_fns) &&
-	    (recv_fn = ninf->recv_fns[md->type])) {
+	if (md->type < ARRAY_SIZE(ninf->recv_fns) && (recv_fn = ninf->recv_fns[md->type])) {
 		md->sender_nth_devd = conn->peer_nth_devd;
 		md->conn_qver = conn->qver;
 		ret = recv_fn(rfi, md);

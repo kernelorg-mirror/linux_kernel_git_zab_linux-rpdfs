@@ -94,6 +94,12 @@ static int recv_block_read_result(struct rpdfs_fs_info *rfi, struct rpdfs_net_me
 	u64 crc;
 	int ret;
 
+	if ((md->ctl_size != sizeof(struct rpdfs_msg_block_read_result)) ||
+	    (md->data_size > 0 && md->data_size != RPDFS_BLOCK_SIZE)) {
+		ret = -EPROTO;
+		goto out;
+	}
+
 	rpdfs_prd("bk "RBKF" err %u", RBKA(&rr->key), rr->err);
 
 	BUILD_BUG_ON(RPDFS_BLOCK_SIZE != PAGE_SIZE);
@@ -157,6 +163,12 @@ static int recv_block_write_result(struct rpdfs_fs_info *rfi, struct rpdfs_net_m
 	struct rpdfs_msg_block_write_result *wr = md->ctl_buf;
 	struct folio *folio;
 	int ret;
+
+	if ((md->ctl_size != sizeof(struct rpdfs_msg_block_write_result)) ||
+	    (md->data_size != 0)) {
+		ret = -EPROTO;
+		goto out;
+	}
 
 	folio = get_block_key_folio(rfi, &wr->key);
 	if (IS_ERR(folio)) {

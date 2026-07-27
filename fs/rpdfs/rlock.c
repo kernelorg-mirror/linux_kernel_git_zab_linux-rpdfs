@@ -270,6 +270,12 @@ static int recv_rlock_grant(struct rpdfs_fs_info *rfi, struct rpdfs_net_message_
 	struct rpdfs_rlock *rlock;
 	int ret;
 
+	if ((md->ctl_size != sizeof(struct rpdfs_msg_rlock)) ||
+	    (md->data_size != 0)) {
+		ret = -EPROTO;
+		goto out;
+	}
+
 	rlock = get_rlock(rlinf, &rlm->key);
 	if (!rlock) {
 		/* we should have pinned, server sent unrequested grant? */
@@ -315,6 +321,12 @@ static int recv_rlock_revoke(struct rpdfs_fs_info *rfi, struct rpdfs_net_message
 	bool preloaded;
 	int ret;
 
+	if ((md->ctl_size != sizeof(struct rpdfs_msg_rlock)) ||
+	    (md->data_size != 0)) {
+		ret = -EPROTO;
+		goto out;
+	}
+
 	rlock = get_rlock(rlinf, &rlm->key);
 	if (!rlock) {
 		/* no rlock, we released, send immediate confirm */
@@ -340,11 +352,11 @@ static int recv_rlock_revoke(struct rpdfs_fs_info *rfi, struct rpdfs_net_message
 
 	if (preloaded)
 		rpdfs_net_preload_end(rfi);
-
 	if (ret == 0)
 		wake_up_all(&rlock->waitq);
-out:
+
 	put_rlock(rlinf, rlock);
+out:
 	return ret;
 }
 
