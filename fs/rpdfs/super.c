@@ -15,6 +15,7 @@
 #include "mkfs.h"
 #include "net.h"
 #include "net_tcp.h"
+#include "params.h"
 #include "parse.h"
 #include "pr.h"
 #include "preq.h"
@@ -22,10 +23,7 @@
 #include "xattr.h"
 
 struct rpdfs_fs_context {
-	/* XXX arbitrary limit on number of addrs */
-	struct rpdfs_net_transport_addr devd_addrs[16];
-	size_t nr_addrs;
-	bool mkfs;
+	struct rpdfs_params params;
 };
 
 static int rpdfs_sync_fs(struct super_block *sb, int wait)
@@ -121,13 +119,13 @@ static int rpdfs_setup(struct rpdfs_fs_info *rfi)
 	return ret;
 }
 
-static int add_devd_addrs(struct rpdfs_fs_info *rfi, struct rpdfs_fs_context *rfc)
+static int add_devd_addrs(struct rpdfs_fs_info *rfi, struct rpdfs_params *params)
 {
 	size_t i;
 	int ret;
 
-	for (i = 0; i < rfc->nr_addrs; i++) {
-		ret = rpdfs_map_add_addr(rfi, &rfc->devd_addrs[i]);
+	for (i = 0; i < params->nr_addrs; i++) {
+		ret = rpdfs_map_add_addr(rfi, &params->devd_addrs[i]);
 		if (ret < 0)
 			break;
 	}
@@ -156,6 +154,8 @@ static int rpdfs_get_tree(struct fs_context *fc)
 		goto out;
 	}
 
+	rfi->params = rfc->params;
+
 	/* generate as early as possible for tracing */
 	generate_random_uuid(rfi->client_uuid);
 	atomic64_set(&rfi->next_free_inode_nr, 2);
@@ -178,7 +178,7 @@ static int rpdfs_get_tree(struct fs_context *fc)
 	 * addresses from the devd qlist.
 	 */
 	ret = rpdfs_setup(rfi) ?:
-	      add_devd_addrs(rfi, rfc) ?:
+	      add_devd_addrs(rfi, &rfi->params) ?:
 	      rpdfs_map_connect(rfi);
 	if (ret < 0)
 		goto out;
@@ -227,15 +227,15 @@ static const struct fs_parameter_spec rpdfs_mount_parameters[] = {
 	{}
 };
 
-static int parse_devd_addr(struct fs_context *fc, struct rpdfs_fs_context *rfc, char *str)
+static int parse_devd_addr(struct fs_context *fc, struct rpdfs_params *params, char *str)
 {
 	int ret;
 
-	if (rfc->nr_addrs >= ARRAY_SIZE(rfc->devd_addrs))
+	if (params->nr_addrs >= ARRAY_SIZE(params->devd_addrs))
 		return invalfc(fc, "too many addresses given, %zu supported.",
-			       ARRAY_SIZE(rfc->devd_addrs));
+			       ARRAY_SIZE(params->devd_addrs));
 
-	ret = rpdfs_parse_ipv4(str, &rfc->devd_addrs[rfc->nr_addrs]._sin);
+	ret = rpdfs_parse_ipv4(str, &params->devd_addrs[params->nr_addrs]._sin);
 	if (ret < 0) {
 		if (ret == -EINVAL)
 			return invalfc(fc, "Invalid ipv4 addr:port");
@@ -243,13 +243,14 @@ static int parse_devd_addr(struct fs_context *fc, struct rpdfs_fs_context *rfc, 
 			return invalfc(fc, "Error parsing ipv4 addr:port: %d", ret);
 	}
 
-	rfc->nr_addrs++;
+	params->nr_addrs++;
 	return 0;
 }
 
 static int rpdfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 {
 	struct rpdfs_fs_context *rfc = fc->fs_private;
+	struct rpdfs_params *params = &rfc->params;
 	struct fs_parse_result result;
 	int token;
 	int ret;
@@ -260,13 +261,13 @@ static int rpdfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 
 	switch (token) {
 	case Opt_devd_addr:
-		ret = parse_devd_addr(fc, rfc, param->string);
+		ret = parse_devd_addr(fc, params, param->string);
 		break;
 	case Opt_mkfs:
-		rfc->mkfs = true;
+		params->mkfs = true;
 		break;
 	case Opt_source:
-		ret = parse_devd_addr(fc, rfc, param->string);
+		ret = parse_devd_addr(fc, params, param->string);
 		if (ret == 0) {
 			fc->source = param->string;
 			param->string = NULL;

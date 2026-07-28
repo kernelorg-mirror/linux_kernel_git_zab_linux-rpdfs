@@ -9,7 +9,7 @@
 
 struct rpdfs_fs_info;
 
-#include "net.h"
+#include "params.h"
 
 struct rpdfs_balloc_info;
 struct rpdfs_block_info;
@@ -20,7 +20,9 @@ struct rpdfs_preq_info;
 struct rpdfs_fs_info {
 	struct super_block *sb;
 	u8 client_uuid[UUID_SIZE];
+	struct rpdfs_params params;
 	atomic64_t next_free_inode_nr;
+
 	struct rpdfs_balloc_info *balloc_info;
 	struct rpdfs_block_info *block_info;
 	struct rpdfs_map_info *map_info;

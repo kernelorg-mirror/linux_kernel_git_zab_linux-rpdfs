@@ -7,6 +7,7 @@
 #include "map.h"
 #include "net.h"
 #include "seqlock.h"
+#include "super.h"
 
 struct addr_map {
 	struct rcu_head rcu;

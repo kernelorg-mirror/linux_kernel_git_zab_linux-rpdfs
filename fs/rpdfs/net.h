@@ -5,8 +5,9 @@
 #include <linux/inet.h>
 #include <linux/bvec.h>
 
+struct rpdfs_fs_info;
+
 #include "format-msg.h"
-#include "super.h"
 
 /*
  * A little convenience that gathers that arguments that describe a
