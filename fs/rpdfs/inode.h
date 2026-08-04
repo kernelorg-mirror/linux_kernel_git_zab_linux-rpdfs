@@ -78,6 +78,10 @@ struct inode *rpdfs_iget(struct super_block *sb, struct rpdfs_inode_nr *ino);
 struct inode *rpdfs_find_inode_rcu(struct super_block *sb, struct rpdfs_iget_data *igd);
 struct inode *rpdfs_new_inode(struct super_block *sb, struct rpdfs_iget_data *igd);
 int rpdfs_inode_rlock_refresh(struct inode *inode, u8 mode, struct rpdfs_rlock_hold *hold);
+int rpdfs_inode_rlock_refresh_many(struct inode *in_a, struct rpdfs_rlock_hold *ho_a,
+				   struct inode *in_b, struct rpdfs_rlock_hold *ho_b,
+				   struct inode *in_c, struct rpdfs_rlock_hold *ho_c,
+				   struct inode *in_d, struct rpdfs_rlock_hold *ho_d, u8 mode);
 void rpdfs_inode_update(struct rpdfs_fs_info *rfi, struct inode *inode);
 
 int rpdfs_inode_init(void);

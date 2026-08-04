@@ -249,6 +249,84 @@ int rpdfs_inode_rlock_refresh(struct inode *inode, u8 mode, struct rpdfs_rlock_h
 }
 
 /*
+ * Returns true if a is greater than b.
+ */
+static bool ino_greater(struct rpdfs_inode_nr *a, struct rpdfs_inode_nr *b)
+{
+	if (le64_to_cpu(a->i[0]) > le64_to_cpu(b->i[0]))
+		return true;
+	if (le64_to_cpu(a->i[0]) < le64_to_cpu(b->i[0]))
+		return false;
+
+	return le64_to_cpu(a->i[1]) > le64_to_cpu(b->i[1]);
+}
+
+/*
+ * Returns true if a's inode_nr is greater than b's, allowing for either
+ * or both to be null.  Nulls are considered as pointers to a maxmimum
+ * value inode so that sorting with this puts nulls at the end.
+ */
+static bool inode_greater_nulls(struct inode *a, struct inode *b)
+{
+	if (a && b)
+		return ino_greater(rpdfs_inode_ino(a), rpdfs_inode_ino(b));
+
+	return a > b;
+}
+
+/*
+ * Acquire the rlock for all the inodes in inode/rlock_key order and
+ * make sure they're refreshed.  Any of the inode pointers can be null.
+ * We use a quick sort network to sort the pointers by their referenced
+ * number, moving nulls to the end.  I hope we all enjoy conditional
+ * branches.
+ *
+ * If this returns an error then non of the rlocks will be held.
+ */
+#define CMP_SWAP(INA, HOA, INB, HOB) \
+do { \
+	if (inode_greater_nulls(INA, INB)) { \
+		swap(INA, INB); \
+		swap(HOA, HOB); \
+	} \
+} while (0)
+int rpdfs_inode_rlock_refresh_many(struct inode *in_a, struct rpdfs_rlock_hold *ho_a,
+				   struct inode *in_b, struct rpdfs_rlock_hold *ho_b,
+				   struct inode *in_c, struct rpdfs_rlock_hold *ho_c,
+				   struct inode *in_d, struct rpdfs_rlock_hold *ho_d, u8 mode)
+{
+	struct rpdfs_fs_info *rfi;
+	int ret;
+
+	/* 01, 23, 02, 13, 12 */
+	CMP_SWAP(in_a, ho_a, in_b, ho_b);
+	CMP_SWAP(in_c, ho_c, in_d, ho_d);
+	CMP_SWAP(in_a, ho_a, in_c, ho_c);
+	CMP_SWAP(in_b, ho_b, in_d, ho_d);
+	CMP_SWAP(in_b, ho_b, in_c, ho_c);
+#undef CMP_SWAP
+
+	if (!in_a) {
+		ret = 0;
+		goto out;
+	}
+	rfi = RPDFS_INODE_FS(in_a);
+
+	ret = (in_a ? rpdfs_inode_rlock_refresh(in_a, mode, ho_a) : 0) ?:
+	      (in_b ? rpdfs_inode_rlock_refresh(in_b, mode, ho_b) : 0) ?:
+	      (in_c ? rpdfs_inode_rlock_refresh(in_c, mode, ho_c) : 0) ?:
+	      (in_d ? rpdfs_inode_rlock_refresh(in_d, mode, ho_d) : 0);
+	if (ret < 0) {
+		rpdfs_rlock_unlock(rfi, ho_a);
+		rpdfs_rlock_unlock(rfi, ho_b);
+		rpdfs_rlock_unlock(rfi, ho_c);
+		rpdfs_rlock_unlock(rfi, ho_d);
+	}
+out:
+	return ret;
+}
+
+/*
  * This only sets the in-memory inode fields (both vfs inode and our
  * inode_info) based on the persistent inode.
  */
