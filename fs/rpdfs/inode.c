@@ -12,11 +12,26 @@
 #include "dir.h"
 #include "file.h"
 #include "inode.h"
+#include "keys.h"
 #include "meta.h"
 #include "mkfs.h"
 #include "pr.h"
 #include "rlock.h"
 #include "seqlock.h"
+
+struct rpdfs_inode_sb_info {
+	struct workqueue_struct *workq;
+};
+
+static struct rpdfs_inode_sb_info *RPDFS_IINF(struct rpdfs_fs_info *rfi)
+{
+	return rfi->inode_sb_info;
+}
+
+static void SET_RPDFS_IINF(struct rpdfs_fs_info *rfi, struct rpdfs_inode_sb_info *iinf)
+{
+	rfi->inode_sb_info = iinf;
+}
 
 /*
  * We're using the cheesy local id for now.  This would use the client
@@ -79,11 +94,13 @@ void rpdfs_evict_inode(struct inode *inode)
 	clear_inode(inode);
 }
 
+static void invalidate_inode_worker(struct work_struct *work);
 static void info_ctor(void *obj)
 {
 	struct rpdfs_inode_info *ri = obj;
 
-	seqlock_init(&ri->refresh_seqlock);
+	seqlock_init(&ri->seqlock);
+	INIT_WORK(&ri->invalidate_work, invalidate_inode_worker);
 	inode_init_once(&ri->vfs_inode);
 }
 
@@ -179,7 +196,7 @@ static int check_refresh_inode(struct rpdfs_fs_info *rfi, struct inode *inode)
 	bool refreshed;
 	int ret;
 
-	while_read_seqretry(&ri->refresh_seqlock)
+	while_read_seqretry(&ri->seqlock)
 		refreshed = ri->refreshed;
 	if (refreshed) {
 		ret = 0;
@@ -193,10 +210,10 @@ static int check_refresh_inode(struct rpdfs_fs_info *rfi, struct inode *inode)
 	}
 	rinode = folio_address(folio);
 
-	write_seqlock(&ri->refresh_seqlock);
+	write_seqlock(&ri->seqlock);
 	if (!ri->refreshed)
 		copy_rinode_to_vfs_inode(inode, rinode);
-	write_sequnlock(&ri->refresh_seqlock);
+	write_sequnlock(&ri->seqlock);
 
 	folio_put(folio);
 	ret = 0;
@@ -204,41 +221,114 @@ out:
 	return ret;
 }
 
-#if 0
-int rpdfs_inode_invalidate(struct super_block *sb, struct rpdfs_inode_nr *ino)
+/*
+ * We invalidate all cached blocks before releasing the rlock because
+ * users don't try and revalidate on use.  There's a good chance we
+ * could leave caches behind and trigger revalidation.  We'd still have
+ * network round-trips but the responses could be a lot smaller if the
+ * revalidating cached version was still current.
+ */
+static void invalidate_inode_worker(struct work_struct *work)
 {
-	struct rpdfs_fs_info *rfi = RPDFS_SB_FS(sb);
-	struct inode *inode;
-	int ret;
+	struct rpdfs_inode_info *ri = container_of(work, struct rpdfs_inode_info, invalidate_work);
+	struct inode *inode = &ri->vfs_inode;
+	struct rpdfs_fs_info *rfi = RPDFS_INODE_FS(inode);
+	struct rpdfs_rlock_key key;
 
-	inode = rpdfs_ilookup(sb, ino);
-	if (!inode) {
-		ret = -ENOENT;
-		goto out;
+	if (ri->invalidate_only_flush) {
+		filemap_fdatawrite(inode->i_mapping);
+		filemap_fdatawrite(ri->shadow_inode->i_mapping);
+		/* XXX io errors */
+		filemap_fdatawait(ri->shadow_inode->i_mapping);
+		filemap_fdatawait(inode->i_mapping);
+	} else {
+		filemap_invalidate_inode(inode, true, 0, LLONG_MAX);
+		filemap_invalidate_inode(ri->shadow_inode, true, 0, LLONG_MAX);
 	}
 
-	ri = RPDFS_I(inode);
-	ri->refreshed = false;
-
-	truncate_inode_pages(inode->i_mapping, 0);
-	iput(inode);
-	ret = 0;
-out:
-	return ret;
-}
+#if 0 /* XXX NYI */
+	/* can't touch during unmount, dcache destroys w/o locks */
+	d_prune_aliases(inode);
 #endif
+
+	rpdfs_rlock_key_from_inode_nr(&key, &ri->ino);
+	rpdfs_rlock_invalidate_finished(rfi, &key);
+
+	iput(inode);
+}
+
+/*
+ * The rlock caller is revoking a mode that protected caches in the
+ * inode.  We always have to flush and might need to also drop the cache
+ * if we're losing read mode coverage.  The flush/invalidation itself
+ * can be very heavy so we hand it off to async work.
+ *
+ * We need to be careful with the inode lookup variant here.  We have to
+ * wait for writeback during evict so we have to wait for inodes to
+ * clear I_WILL_FREE.
+ *
+ * Returns true if the inode was invalidated during the call.  Returns
+ * false if the invalidation is now pending and
+ * rpdfs_rlock_invalidate_finished() will be called later.
+ */
+bool rpdfs_inode_invalidate(struct super_block *sb, struct rpdfs_inode_nr *ino, bool only_flush)
+{
+	struct rpdfs_fs_info *rfi = RPDFS_SB_FS(sb);
+	struct rpdfs_inode_sb_info *iinf = RPDFS_IINF(rfi);
+	struct rpdfs_iget_data igd = { *ino, false };
+	struct rpdfs_inode_info *ri;
+	struct inode *inode;
+
+	inode = rpdfs_ilookup(sb, &igd);
+	if (!inode)
+		return true;
+
+	ri = RPDFS_I(inode);
+
+	write_seqlock(&ri->seqlock);
+	ri->refreshed = false;
+	ri->invalidate_counter++;
+	ri->invalidate_only_flush = only_flush;
+	write_sequnlock(&ri->seqlock);
+
+	/* the worker calls the iput for our ilookup */
+	queue_work(iinf->workq, &ri->invalidate_work);
+	return false;
+}
+
+u64 rpdfs_inode_invalidate_counter(struct inode *inode)
+{
+	struct rpdfs_inode_info *ri = RPDFS_I(inode);
+	u64 ctr;
+
+	while_read_seqretry(&ri->seqlock)
+		ctr = ri->invalidate_counter;
+
+	return ctr;
+}
+
+int rpdfs_inode_cmp_inos(struct rpdfs_inode_nr *a, struct rpdfs_inode_nr *b)
+{
+	return rpdfs_compare(le64_to_cpu(a->i[0]), le64_to_cpu(b->i[0])) ?:
+	       rpdfs_compare(le64_to_cpu(a->i[1]), le64_to_cpu(b->i[1]));
+}
+
+int rpdfs_inode_rlock_ino(struct rpdfs_fs_info *rfi, struct rpdfs_inode_nr *ino, u8 mode,
+			  struct rpdfs_rlock_hold *hold)
+{
+	struct rpdfs_rlock_key key;
+
+	rpdfs_rlock_key_from_inode_nr(&key, ino);
+	return rpdfs_rlock_lock(rfi, &key, mode, hold);
+}
 
 int rpdfs_inode_rlock_refresh(struct inode *inode, u8 mode, struct rpdfs_rlock_hold *hold)
 {
 	struct rpdfs_fs_info *rfi = RPDFS_INODE_FS(inode);
 	struct rpdfs_inode_info *ri = RPDFS_I(inode);
-	struct rpdfs_rlock_key key;
 	int ret;
 
-	key.k[0] = ri->ino.i[0];
-	key.k[1] = ri->ino.i[1];
-
-	ret = rpdfs_rlock_lock(rfi, &key, mode, hold);
+	ret = rpdfs_inode_rlock_ino(rfi, &ri->ino,  mode, hold);
 	if (ret == 0) {
 		ret = check_refresh_inode(rfi, inode);
 		if (ret < 0)
@@ -397,8 +487,19 @@ struct inode *rpdfs_iget(struct super_block *sb, struct rpdfs_inode_nr *ino)
 {
 	struct rpdfs_fs_info *rfi = RPDFS_SB_FS(sb);
 	struct rpdfs_iget_data igd = { *ino, false };
+	DECLARE_RPDFS_RLOCK_HOLD(hold);
 	struct inode *inode;
+	bool is_mkfs;
+	u8 mode;
 	int ret;
+
+	/* XXX hack until we have real mkfs in userland */
+	is_mkfs = !sb->s_root && RPDFS_FSINFO_PARAM(rfi, mkfs);
+	mode = is_mkfs ? RPDFS_RLOCK_MODE_EX_WR : RPDFS_RLOCK_MODE_SH_RD;
+
+	ret = rpdfs_inode_rlock_ino(rfi, ino, mode, &hold);
+	if (ret < 0)
+		goto out;
 
 	inode = iget5_locked(sb, iget_hashval(&igd), rpdfs_iget_test, rpdfs_iget_set, &igd);
 	if (!inode) {
@@ -415,8 +516,7 @@ struct inode *rpdfs_iget(struct super_block *sb, struct rpdfs_inode_nr *ino)
 	if (ret < 0)
 		goto out;
 
-	/* XXX hack until we have real mkfs in userland */
-	if (!sb->s_root && RPDFS_FSINFO_PARAM(rfi, mkfs)) {
+	if (is_mkfs) {
 		ret = rpdfs_mkfs_root_inode(inode);
 		if (ret < 0)
 			goto out;
@@ -436,6 +536,8 @@ out:
 	       inode = ERR_PTR(ret);
 	}
 
+	rpdfs_rlock_unlock(rfi, &hold);
+
 	return inode;
 }
 
@@ -447,6 +549,17 @@ out:
 struct inode *rpdfs_find_inode_rcu(struct super_block *sb, struct rpdfs_iget_data *igd)
 {
 	return find_inode_rcu(sb, iget_hashval(igd), rpdfs_iget_test, igd);
+}
+
+/*
+ * This is called by invalidation to find inodes whose caches need to be
+ * dropped.  It waits for I_NEW and I_FREEING to clear which prevents
+ * inode holders with those states (iget, evict) from blocking on
+ * rlocks.
+ */
+struct inode *rpdfs_ilookup(struct super_block *sb, struct rpdfs_iget_data *igd)
+{
+	return ilookup5(sb, iget_hashval(igd), rpdfs_iget_test, igd);
 }
 
 /*
@@ -554,9 +667,14 @@ int rpdfs_getattr(struct mnt_idmap *idmap, const struct path *path,
 		  unsigned int query_flags)
 {
 	struct inode *inode = d_inode(path->dentry);
+	struct rpdfs_fs_info *rfi = RPDFS_INODE_FS(inode);
+	DECLARE_RPDFS_RLOCK_HOLD(hold);
 	struct rpdfs_inode_info *ri;
+	int ret;
 
-	/* XXX rlock/refresh */
+	ret = rpdfs_inode_rlock_refresh(inode, RPDFS_RLOCK_MODE_SH_RD, &hold);
+	if (ret < 0)
+		goto out;
 
 	if (request_mask & STATX_BTIME) {
 		ri = RPDFS_I(inode);
@@ -565,17 +683,22 @@ int rpdfs_getattr(struct mnt_idmap *idmap, const struct path *path,
 	}
 
 	generic_fillattr(idmap, request_mask, inode, stat);
-
-	return 0;
+	ret = 0;
+out:
+	rpdfs_rlock_unlock(rfi, &hold);
+	return ret;
 }
 
 int rpdfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr *attr)
 {
 	struct inode *inode = d_inode(dentry);
 	struct rpdfs_fs_info *rfi = RPDFS_INODE_FS(inode);
+	DECLARE_RPDFS_RLOCK_HOLD(hold);
 	int ret;
 
-	/* XXX rlock, checkpoint */
+	ret = rpdfs_inode_rlock_refresh(inode, RPDFS_RLOCK_MODE_EX_WR, &hold);
+	if (ret < 0)
+		goto out;
 
 	ret = setattr_prepare(idmap, dentry, attr);
 	if (ret == 0) {
@@ -583,8 +706,43 @@ int rpdfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr *
 		inode_inc_iversion(inode);
 		rpdfs_inode_update(rfi, inode);
 	}
-
+out:
+	rpdfs_rlock_unlock(rfi, &hold);
 	return ret;
+}
+
+int rpdfs_inode_sb_setup(struct rpdfs_fs_info *rfi)
+{
+	struct rpdfs_inode_sb_info *iinf = NULL;
+	int ret;
+
+	iinf = kzalloc(sizeof(struct rpdfs_inode_sb_info), GFP_NOFS);
+	if (iinf)
+		iinf->workq = alloc_workqueue("rpdfs-inode-invalidate",
+					      WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+	if (!iinf || !iinf->workq) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	SET_RPDFS_IINF(rfi, iinf);
+	ret = 0;
+out:
+	if (ret < 0)
+		rpdfs_inode_sb_destroy(rfi);
+	return ret;
+}
+
+void rpdfs_inode_sb_destroy(struct rpdfs_fs_info *rfi)
+{
+	struct rpdfs_inode_sb_info *iinf = RPDFS_IINF(rfi);
+
+	if (iinf) {
+		if (iinf->workq)
+			destroy_workqueue(iinf->workq);
+		kfree(iinf);
+		SET_RPDFS_IINF(rfi, NULL);
+	}
 }
 
 int rpdfs_inode_init(void)

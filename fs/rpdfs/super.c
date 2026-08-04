@@ -9,6 +9,7 @@
 #include <linux/statfs.h>
 
 #include "aops.h"
+#include "dir.h"
 #include "inode.h"
 #include "map.h"
 #include "net.h"
@@ -80,6 +81,7 @@ static int rpdfs_set_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	sb->s_xattr = rpdfs_xattr_handlers;
 	sb->s_op = &rpdfs_sop;
+	sb->s_d_op = &rpdfs_dentry_ops;
 	sb->s_time_gran = 1;
 	sb->s_time_min = 0;
 	sb->s_time_max = U64_MAX / NSEC_PER_SEC;
@@ -94,6 +96,7 @@ static void rpdfs_destroy(struct rpdfs_fs_info *rfi)
 	rpdfs_preq_destroy(rfi);
 	rpdfs_aops_destroy(rfi);
 	rpdfs_rlock_destroy(rfi);
+	rpdfs_inode_sb_destroy(rfi);
 	rpdfs_map_destroy(rfi);
 	rpdfs_net_destroy(rfi);
 }
@@ -104,6 +107,7 @@ static int rpdfs_setup(struct rpdfs_fs_info *rfi)
 
 	ret = rpdfs_net_setup(rfi, &rpdfs_net_tcp_ops) ?:
 	      rpdfs_map_setup(rfi) ?:
+	      rpdfs_inode_sb_setup(rfi) ?:
 	      rpdfs_rlock_setup(rfi) ?:
 	      rpdfs_aops_setup(rfi) ?:
 	      rpdfs_preq_setup(rfi);

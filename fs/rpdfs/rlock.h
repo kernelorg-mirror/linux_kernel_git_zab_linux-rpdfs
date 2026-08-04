@@ -24,6 +24,7 @@ static inline void rpdfs_rlock_init_hold(struct rpdfs_rlock_hold *hold)
 int rpdfs_rlock_lock(struct rpdfs_fs_info *rfi, struct rpdfs_rlock_key *key, u8 mode,
 		     struct rpdfs_rlock_hold *hold);
 void rpdfs_rlock_unlock(struct rpdfs_fs_info *rfi, struct rpdfs_rlock_hold *hold);
+void rpdfs_rlock_invalidate_finished(struct rpdfs_fs_info *rfi, struct rpdfs_rlock_key *key);
 
 int rpdfs_rlock_setup(struct rpdfs_fs_info *rfi);
 void rpdfs_rlock_destroy(struct rpdfs_fs_info *rfi);

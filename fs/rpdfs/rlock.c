@@ -9,6 +9,8 @@
 #include "rlock.h"
 #include "format-msg.h"
 #include "ht.h"
+#include "inode.h"
+#include "keys.h"
 #include "map.h"
 #include "pr.h"
 #include "rpdfs_trace.h"
@@ -39,6 +41,8 @@ struct rpdfs_rlock {
 	u8 grant_mode;
 	u8 request_mode;
 	u8 revoke_mode;
+	u8 invalidate_pending:1,
+	   invalidated:1;
 };
 
 static const struct rpdfs_rlock nil_rlock;
@@ -243,18 +247,40 @@ static int send_rlock_message(struct rpdfs_fs_info *rfi, struct rpdfs_rlock_key 
  */
 static int try_send_confirm(struct rpdfs_fs_info *rfi, struct rpdfs_rlock *rlock)
 {
+	struct super_block *sb = rfi->sb;
+	struct rpdfs_inode_nr ino;
+	bool only_flush;
 	int ret = 0;
 
-	if (rlock->revoke_mode && hold_compatible(holders_mode(rlock), rlock->revoke_mode)) {
-		ret = send_rlock_message(rfi, &rlock->key, RPDFS_MSG_RLOCK_CONFIRM,
-					  rlock->revoke_mode, GFP_NOWAIT);
-		if (ret == 0) {
-			rlock->grant_mode = rlock->revoke_mode;
-			rlock->revoke_mode = RPDFS_RLOCK_MODE_NULL;
-			rpdfs_prd("sent confirm "RLF, RLA(rlock));
+	if (!rlock->revoke_mode || !hold_compatible(holders_mode(rlock), rlock->revoke_mode))
+		goto out;
+
+	/* need to wait for invalidation */
+	if (rlock->grant_mode >= RPDFS_RLOCK_MODE_SH_RD && !rlock->invalidated) {
+		if (!rlock->invalidate_pending) {
+			only_flush = rlock->grant_mode == RPDFS_RLOCK_MODE_EX_WR &&
+			             rlock->revoke_mode == RPDFS_RLOCK_MODE_SH_RD;
+			rpdfs_inode_nr_from_rlock_key(&ino, &rlock->key);
+			rlock->invalidated = rpdfs_inode_invalidate(sb, &ino, only_flush);
+			if (!rlock->invalidated)
+				rlock->invalidate_pending = 1;
 		}
+		if (!rlock->invalidated)
+			goto out;
 	}
 
+	ret = send_rlock_message(rfi, &rlock->key, RPDFS_MSG_RLOCK_CONFIRM,
+				  rlock->revoke_mode, GFP_NOWAIT);
+	if (ret < 0)
+		goto out;
+
+	rlock->grant_mode = rlock->revoke_mode;
+	rlock->revoke_mode = RPDFS_RLOCK_MODE_NULL;
+	rlock->invalidate_pending = 0;
+	rlock->invalidated = 0;
+	rpdfs_prd("sent confirm "RLF, RLA(rlock));
+	ret = 0;
+out:
 	return ret;
 }
 
@@ -475,6 +501,35 @@ void rpdfs_rlock_unlock(struct rpdfs_fs_info *rfi, struct rpdfs_rlock_hold *hold
 	 * This is a failure to participate in the rlock protocol.
 	 * We'd go read-only, abort, etc.
 	 */
+	BUG_ON(ret < 0);
+}
+
+void rpdfs_rlock_invalidate_finished(struct rpdfs_fs_info *rfi, struct rpdfs_rlock_key *key)
+{
+	struct rpdfs_rlock_info *rlinf = RPDFS_RLINF(rfi);
+	struct rpdfs_rlock *rlock;
+	bool preloaded;
+	int ret;
+
+	rlock = get_rlock(rlinf, key);
+	if (!rlock)
+		return;
+
+	preloaded = rpdfs_net_preload(rfi, GFP_NOFS) == 0;
+
+	write_seqlock(&rlock->seqlock);
+	rlock->invalidate_pending = 0;
+	rlock->invalidated = 1;
+	ret = try_send_confirm(rfi, rlock);
+	write_sequnlock(&rlock->seqlock);
+
+	if (preloaded)
+		rpdfs_net_preload_end(rfi);
+
+	wake_up_all(&rlock->waitq);
+	put_rlock(rlinf, rlock);
+
+	/* XXX another client protocol failure */
 	BUG_ON(ret < 0);
 }
 

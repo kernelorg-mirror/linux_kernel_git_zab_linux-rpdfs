@@ -22,9 +22,9 @@ struct rpdfs_iget_data {
 	RPDFS_I(inode)->is_shadow
 
 struct rpdfs_inode_info {
+	seqlock_t seqlock;
 
 	/* updating vfs inode after acquiring rlock */
-	seqlock_t refresh_seqlock;
 	bool refreshed;
 
 	/* Uniquifier to avoid xattr name hash collisions */
@@ -40,6 +40,10 @@ struct rpdfs_inode_info {
 	struct rpdfs_ehtable_desc dirent_eht;
 	struct rpdfs_ehtable_desc xattr_eht;
 
+	struct work_struct invalidate_work;
+	u64 invalidate_counter;
+	bool invalidate_only_flush;
+
 	struct inode vfs_inode;
 };
 
@@ -53,9 +57,9 @@ static inline struct rpdfs_inode_info *RPDFS_FOLIO_I(struct folio *folio)
 	return RPDFS_I(folio_inode(folio));
 }
 
-static inline struct rpdfs_inode_nr rpdfs_inode_ino(struct inode *inode)
+static inline struct rpdfs_inode_nr *rpdfs_inode_ino(struct inode *inode)
 {
-	return RPDFS_I(inode)->ino;
+	return &RPDFS_I(inode)->ino;
 }
 
 void rpdfs_alloc_inode_nr(struct rpdfs_fs_info *rfi, struct rpdfs_inode_nr *ino);
@@ -76,7 +80,13 @@ int rpdfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 
 struct inode *rpdfs_iget(struct super_block *sb, struct rpdfs_inode_nr *ino);
 struct inode *rpdfs_find_inode_rcu(struct super_block *sb, struct rpdfs_iget_data *igd);
+struct inode *rpdfs_ilookup(struct super_block *sb, struct rpdfs_iget_data *igd);
 struct inode *rpdfs_new_inode(struct super_block *sb, struct rpdfs_iget_data *igd);
+bool rpdfs_inode_invalidate(struct super_block *sb, struct rpdfs_inode_nr *ino, bool only_flush);
+u64 rpdfs_inode_invalidate_counter(struct inode *inode);
+int rpdfs_inode_cmp_inos(struct rpdfs_inode_nr *a, struct rpdfs_inode_nr *b);
+int rpdfs_inode_rlock_ino(struct rpdfs_fs_info *rfi, struct rpdfs_inode_nr *ino, u8 mode,
+			  struct rpdfs_rlock_hold *hold);
 int rpdfs_inode_rlock_refresh(struct inode *inode, u8 mode, struct rpdfs_rlock_hold *hold);
 int rpdfs_inode_rlock_refresh_many(struct inode *in_a, struct rpdfs_rlock_hold *ho_a,
 				   struct inode *in_b, struct rpdfs_rlock_hold *ho_b,
@@ -84,6 +94,8 @@ int rpdfs_inode_rlock_refresh_many(struct inode *in_a, struct rpdfs_rlock_hold *
 				   struct inode *in_d, struct rpdfs_rlock_hold *ho_d, u8 mode);
 void rpdfs_inode_update(struct rpdfs_fs_info *rfi, struct inode *inode);
 
+int rpdfs_inode_sb_setup(struct rpdfs_fs_info *rfi);
+void rpdfs_inode_sb_destroy(struct rpdfs_fs_info *rfi);
 int rpdfs_inode_init(void);
 void rpdfs_inode_exit(void);
 

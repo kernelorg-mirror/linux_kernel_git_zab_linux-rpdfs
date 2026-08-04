@@ -59,7 +59,7 @@ static u32 name_hash(const char *name, size_t name_len)
 
 static void set_dent_args_inode(struct dent_args *da, struct inode *inode)
 {
-	da->dent.ino = rpdfs_inode_ino(inode);
+	da->dent.ino = *rpdfs_inode_ino(inode);
 }
 
 static void init_dent_args(struct dent_args *da, struct dentry *dentry, struct inode *inode)
@@ -124,9 +124,111 @@ static int delete_entry(struct inode *dir, struct dent_args *da)
 	return rpdfs_ehtable_delete(dir, &ri->dirent_eht, RPDFS_BLOCK_KEY_TYPE_DIRENT, &iargs);
 }
 
+/*
+ * Between d_time and d_fsdata we have 64bits of counter storage on
+ * 32bit.  This is called with the rlock held so the counter won't
+ * change.
+ */
+static void set_invalidate_counter(struct inode *dir, struct dentry *dentry)
+{
+	u64 ctr = rpdfs_inode_invalidate_counter(dir);
+
+	spin_lock(&dentry->d_lock);
+	raw_write_seqcount_begin(&dentry->d_seq);
+
+	if (sizeof(dentry->d_time) < sizeof(ctr)) {
+		dentry->d_time = (u32)ctr;
+		dentry->d_fsdata = (void *)(uintptr_t)(ctr >> 32);
+	} else  {
+		dentry->d_time = ctr;
+	}
+
+	raw_write_seqcount_end(&dentry->d_seq);
+	spin_unlock(&dentry->d_lock);
+}
+
+/*
+ * It's reasonably important to have read-only tests in d_revalidate as
+ * tasks do full path resolution with shared prefixes.
+ */
+static bool stale_invalidate_counter(struct inode *dir, struct dentry *dentry)
+{
+	u64 ctr = rpdfs_inode_invalidate_counter(dir);
+	unsigned seq;
+	bool stale;
+
+	do {
+		seq = read_seqcount_begin(&dentry->d_seq);
+
+		if (sizeof(dentry->d_time) < sizeof(ctr)) {
+			u64 d_ctr = ((u64)(uintptr_t)dentry->d_fsdata << 32) | dentry->d_time;
+			stale = d_ctr != ctr;
+		} else  {
+			stale = dentry->d_time != ctr;
+		}
+
+	} while (read_seqcount_retry(&dentry->d_seq, seq));
+
+	return stale;
+}
+
+static int rpdfs_d_revalidate(struct inode *dir, const struct qstr *name, struct dentry *dentry,
+			      unsigned int flags)
+{
+	return !stale_invalidate_counter(dir, dentry);
+}
+
+/*
+ * The dentry args that vfs callers check can go stale before our
+ * methods are called and we're able to protect them across the network
+ * with rlocks.  This is effectively a mini d_revalidate->lookup.  We
+ * check for the presence of the dirent and synthesize errors that the
+ * caller would have seen.
+ */
+static int validate_dentry(struct inode *dir, struct dentry *dentry, struct dent_args *da)
+{
+	const bool positive = dentry->d_inode != NULL;
+	int ret;
+
+	/* expected fast path */
+	if (!stale_invalidate_counter(dir, dentry)) {
+		ret = 0;
+		goto out;
+	}
+
+	ret = lookup_entry(dir, da);
+	if (ret < 0 && ret != -ENOENT)
+		goto out;
+
+	/* caller expected negative but there was a dirent */
+	if (!positive && ret == 0) {
+		ret = -EEXIST;
+		goto out;
+	}
+
+	/* caller expected positive but there was no dirent */
+	if (positive && ret == -ENOENT) {
+		ret = -ENOENT;
+	}
+
+	/* name linked to different inode than caller's */
+	if (rpdfs_inode_cmp_inos(&da->dent.ino, rpdfs_inode_ino(dentry->d_inode)) != 0) {
+		ret = -ESTALE;
+		goto out;
+	}
+
+	/* dirent ino matches dentry ino */
+	set_invalidate_counter(dir, dentry);
+	ret = 0;
+out:
+	return ret;
+}
+
 static struct dentry *rpdfs_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
 {
+	struct rpdfs_fs_info *rfi = RPDFS_INODE_FS(dir);
 	struct super_block *sb = dir->i_sb;
+	DECLARE_RPDFS_RLOCK_HOLD(hold);
 	struct dent_args da;
 	struct inode *inode;
 	int ret;
@@ -138,7 +240,13 @@ static struct dentry *rpdfs_lookup(struct inode *dir, struct dentry *dentry, uns
 
 	init_dent_args(&da, dentry, NULL);
 
-	/* XXX rlock, refresh */
+	ret = rpdfs_inode_rlock_refresh(dir, RPDFS_RLOCK_MODE_SH_RD, &hold);
+	if (ret < 0) {
+		inode = ERR_PTR(ret);
+		goto out;
+	}
+
+	set_invalidate_counter(dir, dentry);
 
 	ret = lookup_entry(dir, &da);
 	if (ret < 0 && ret != -ENOENT) {
@@ -151,6 +259,8 @@ static struct dentry *rpdfs_lookup(struct inode *dir, struct dentry *dentry, uns
 	else
 		inode = rpdfs_iget(sb, &da.dent.ino);
 out:
+	rpdfs_rlock_unlock(rfi, &hold);
+
 	/* d_splice_alias passes through ERR_PTR inodes */
 	return d_splice_alias(inode, dentry);
 }
@@ -185,15 +295,25 @@ static struct inode *create_new_inode(struct mnt_idmap *idmap, struct inode *dir
 {
 	struct super_block *sb = dir->i_sb;
 	struct rpdfs_fs_info *rfi = RPDFS_INODE_FS(dir);
+	DECLARE_RPDFS_RLOCK_HOLD(dir_hold);
+	DECLARE_RPDFS_RLOCK_HOLD(inode_hold);
 	struct inode *inode = NULL;
 	struct rpdfs_iget_data igd;
 	struct dent_args da;
 	int ret;
 
-	/* XXX rlock, refresh, checkpoint */
-
 	rpdfs_alloc_inode_nr(rfi, &igd.ino);
 	igd.is_shadow = false;
+
+	/* a little awkward because we don't have the allocated inode yet */
+	if (rpdfs_inode_cmp_inos(&igd.ino, rpdfs_inode_ino(dir)) < 0)
+		ret = rpdfs_inode_rlock_ino(rfi, &igd.ino, RPDFS_RLOCK_MODE_EX_WR, &inode_hold) ?:
+		      rpdfs_inode_rlock_refresh(dir, RPDFS_RLOCK_MODE_EX_WR, &dir_hold);
+	else
+		ret = rpdfs_inode_rlock_refresh(dir, RPDFS_RLOCK_MODE_EX_WR, &dir_hold) ?:
+		      rpdfs_inode_rlock_ino(rfi, &igd.ino, RPDFS_RLOCK_MODE_EX_WR, &inode_hold);
+	if (ret < 0)
+		goto out;
 
 	inode = rpdfs_new_inode(sb, &igd);
 	if (IS_ERR(inode)) {
@@ -203,11 +323,14 @@ static struct inode *create_new_inode(struct mnt_idmap *idmap, struct inode *dir
 	}
 
 	if (dentry) {
+		set_invalidate_counter(dir, dentry);
 		init_dent_args(&da, dentry, inode);
 
 		ret = insert_entry(dir, &da);
 		if (ret < 0)
 			goto out;
+
+		set_dir_i_size(dir);
 	}
 
 	/* update vfs inodes */
@@ -225,8 +348,12 @@ static struct inode *create_new_inode(struct mnt_idmap *idmap, struct inode *dir
 	rpdfs_inode_update(rfi, inode);
 	ret = 0;
 out:
-	set_dir_i_size(dir);
-	rpdfs_inode_update(rfi, dir);
+	/* ehtable can change while returning error */
+	if (!IS_ERR_OR_NULL(inode))
+		rpdfs_inode_update(rfi, dir);
+
+	rpdfs_rlock_unlock(rfi, &dir_hold);
+	rpdfs_rlock_unlock(rfi, &inode_hold);
 
 	if (ret < 0) {
 		if (!IS_ERR_OR_NULL(inode))
@@ -309,10 +436,17 @@ static int rpdfs_unlink(struct inode *dir, struct dentry *dentry)
 {
 	struct rpdfs_fs_info *rfi = RPDFS_INODE_FS(dir);
 	struct inode *inode = d_inode(dentry);
+	DECLARE_RPDFS_RLOCK_HOLD(hold);
 	struct dent_args da;
 	int ret;
 
 	init_dent_args(&da, dentry, inode);
+
+	ret = rpdfs_inode_rlock_refresh(dir, RPDFS_RLOCK_MODE_EX_WR, &hold);
+	if (ret < 0) {
+		inode = ERR_PTR(ret);
+		goto out;
+	}
 
 	ret = check_unlink(dir, inode, dentry) ?:
 	      delete_entry(dir, &da);
@@ -335,6 +469,7 @@ static int rpdfs_unlink(struct inode *dir, struct dentry *dentry)
 	ret = 0;
 out:
 	rpdfs_inode_update(rfi, dir);
+	rpdfs_rlock_unlock(rfi, &hold);
 
 	return ret;
 }
@@ -350,6 +485,10 @@ static int rpdfs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct d
 	struct rpdfs_fs_info *rfi = RPDFS_INODE_FS(old_dir);
 	struct inode *old_inode = d_inode(old_dentry);
 	struct inode *new_inode = d_inode(new_dentry);
+	DECLARE_RPDFS_RLOCK_HOLD(old_dir_hold);
+	DECLARE_RPDFS_RLOCK_HOLD(new_dir_hold);
+	DECLARE_RPDFS_RLOCK_HOLD(old_inode_hold);
+	DECLARE_RPDFS_RLOCK_HOLD(new_inode_hold);
 	bool cleanup_existing = false;
 	bool cleanup_new = false;
 	struct dent_args old_da;
@@ -373,22 +512,31 @@ static int rpdfs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct d
 	init_dent_args(&old_da, old_dentry, NULL);
 	init_dent_args(&new_da, new_dentry, NULL);
 
+	ret = rpdfs_inode_rlock_refresh_many(old_dir, &old_dir_hold,
+					     new_dir, &new_dir_hold,
+					     old_inode, &old_inode_hold,
+					     new_inode, &new_inode_hold, RPDFS_RLOCK_MODE_EX_WR) ?:
+	      validate_dentry(old_dir, old_dentry, &old_da) ?:
+	      validate_dentry(new_dir, new_dentry, &new_da);
+	if (ret < 0)
+		goto out;
+
 	if (new_inode) {
 		ret = delete_entry(new_dir, &new_da);
 		if (ret < 0)
-			goto out;
+			goto update_dirs;
 		cleanup_existing = true;
 	}
 
 	set_dent_args_inode(&new_da, old_inode);
 	ret = insert_entry(new_dir, &new_da);
 	if (ret < 0)
-		goto out;
+		goto cleanup;
 	cleanup_new = true;
 
 	ret = delete_entry(old_dir, &old_da);
 	if (ret < 0)
-		goto out;
+		goto cleanup;
 
 	/* and link counts */
 	if (new_inode) {
@@ -420,7 +568,8 @@ static int rpdfs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct d
 		rpdfs_inode_update(rfi, new_inode);
 
 	ret = 0;
-out:
+
+cleanup:
 	if (ret < 0) {
 		if (cleanup_existing) {
 			set_dent_args_inode(&new_da, new_inode);
@@ -430,9 +579,17 @@ out:
 			err |= delete_entry(new_dir, &new_da);
 		BUG_ON(err); /* XXX need to ensure successful cleanup */
 	}
+
+update_dirs:
 	rpdfs_inode_update(rfi, old_dir);
 	if (new_dir != old_dir)
 		rpdfs_inode_update(rfi, new_dir);
+
+out:
+	rpdfs_rlock_unlock(rfi, &old_dir_hold);
+	rpdfs_rlock_unlock(rfi, &new_dir_hold);
+	rpdfs_rlock_unlock(rfi, &old_inode_hold);
+	rpdfs_rlock_unlock(rfi, &new_inode_hold);
 
 	return ret;
 }
@@ -523,4 +680,8 @@ const struct inode_operations rpdfs_dir_iops = {
 const struct file_operations rpdfs_dir_fops = {
 	.read		= generic_read_dir,
 	.iterate_shared	= rpdfs_readdir,
+};
+
+const struct dentry_operations rpdfs_dentry_ops = {
+	.d_revalidate   = rpdfs_d_revalidate,
 };
