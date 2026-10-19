@@ -436,13 +436,16 @@ static int rpdfs_unlink(struct inode *dir, struct dentry *dentry)
 {
 	struct rpdfs_fs_info *rfi = RPDFS_INODE_FS(dir);
 	struct inode *inode = d_inode(dentry);
-	DECLARE_RPDFS_RLOCK_HOLD(hold);
+	DECLARE_RPDFS_RLOCK_HOLD(dir_hold);
+	DECLARE_RPDFS_RLOCK_HOLD(inode_hold);
 	struct dent_args da;
 	int ret;
 
 	init_dent_args(&da, dentry, inode);
 
-	ret = rpdfs_inode_rlock_refresh(dir, RPDFS_RLOCK_MODE_EX_WR, &hold);
+	ret = rpdfs_inode_rlock_refresh_many(dir, &dir_hold, inode, &inode_hold,
+					     NULL, NULL, NULL, NULL,
+					     RPDFS_RLOCK_MODE_EX_WR);
 	if (ret < 0) {
 		inode = ERR_PTR(ret);
 		goto out;
@@ -469,7 +472,8 @@ static int rpdfs_unlink(struct inode *dir, struct dentry *dentry)
 	ret = 0;
 out:
 	rpdfs_inode_update(rfi, dir);
-	rpdfs_rlock_unlock(rfi, &hold);
+	rpdfs_rlock_unlock(rfi, &inode_hold);
+	rpdfs_rlock_unlock(rfi, &dir_hold);
 
 	return ret;
 }
