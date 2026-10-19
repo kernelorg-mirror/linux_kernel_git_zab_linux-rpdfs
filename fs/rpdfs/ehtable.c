@@ -232,7 +232,7 @@ static int insert_entry(struct rpdfs_ehtable_block *ehb, struct rpdfs_ehtable_it
 			break;
 		}
 
-		if (ins.probe_len < ent->probe_len)
+		if (ins.probe_len > ent->probe_len)
 			swap(ins, *ent);
 	}
 
