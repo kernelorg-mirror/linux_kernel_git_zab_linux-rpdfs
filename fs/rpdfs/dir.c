@@ -670,6 +670,25 @@ out:
 	return ret;
 }
 
+/*
+ * Basic tmpfile support. This still needs to mark the inode as an orphan.
+ */
+static int rpdfs_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
+			 struct file *file, umode_t mode)
+{
+	struct inode *inode;
+
+	inode = create_new_inode(idmap, dir, NULL, mode);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
+
+	d_tmpfile(file, inode);
+	mark_inode_dirty(inode);
+	unlock_new_inode(inode);
+
+	return finish_open_simple(file, 0);
+}
+
 const struct inode_operations rpdfs_dir_iops = {
 	.create		= rpdfs_create,
 	.getattr	= rpdfs_getattr,
@@ -677,6 +696,7 @@ const struct inode_operations rpdfs_dir_iops = {
 	.mkdir		= rpdfs_mkdir,
 	.rename		= rpdfs_rename,
 	.setattr	= rpdfs_setattr,
+	.tmpfile	= rpdfs_tmpfile,
 	.unlink		= rpdfs_unlink,
 	.rmdir		= rpdfs_rmdir,
 };
